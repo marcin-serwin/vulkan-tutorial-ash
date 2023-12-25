@@ -170,9 +170,9 @@ struct QueueFamily {
 
 struct SwapChainData {
     swap_chain: SwapchainKHR,
-    swap_chain_images: Vec<Image>,
-    swap_chain_format: Format,
-    swap_chain_extent: Extent2D,
+    images: Vec<Image>,
+    format: Format,
+    extent: Extent2D,
 }
 
 struct HelloTriangleApplication {
@@ -182,6 +182,7 @@ struct HelloTriangleApplication {
     device: Device,
     queue_family: QueueFamily,
     swap_chain_data: SwapChainData,
+    image_views: Vec<ImageView>,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -201,15 +202,14 @@ impl HelloTriangleApplication {
         };
 
         let swapchain = Swapchain::new(&instance, &device);
-        let (swap_chain, swap_chain_format, swap_chain_extent) = Self::create_swap_chain(
+        let swap_chain_data = Self::create_swap_chain(
             &swapchain,
             window,
             surface,
             swap_chain_support_details,
             queue_indices,
         );
-        let swap_chain_images = unsafe { swapchain.get_swapchain_images(swap_chain) }
-            .expect("failed to get swapchain images");
+        let image_views = Self::create_image_views(&device, &swap_chain_data);
 
         Self {
             entry,
@@ -217,12 +217,8 @@ impl HelloTriangleApplication {
             surface,
             device,
             queue_family,
-            swap_chain_data: SwapChainData {
-                swap_chain,
-                swap_chain_format,
-                swap_chain_extent,
-                swap_chain_images,
-            },
+            swap_chain_data,
+            image_views,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -470,7 +466,7 @@ impl HelloTriangleApplication {
         surface: SurfaceKHR,
         swap_chain_support: SwapChainSupportDetails,
         queue_family_indices: QueueFamilyIndices,
-    ) -> (SwapchainKHR, Format, Extent2D) {
+    ) -> SwapChainData {
         let surface_format = Self::choose_swap_surface_format(&swap_chain_support.formats);
         let present_mode = Self::choose_swap_present_mode(&swap_chain_support.present_modes);
         let extent = Self::choose_swap_extent(window, &swap_chain_support.capabilities);
@@ -523,10 +519,18 @@ impl HelloTriangleApplication {
             ..Default::default()
         };
 
-        let swapchain = unsafe { swapchain.create_swapchain(&create_info, None) }
+        let swap_chain = unsafe { swapchain.create_swapchain(&create_info, None) }
             .expect("failed to create swapchain");
 
-        (swapchain, surface_format.format, extent)
+        let images = unsafe { swapchain.get_swapchain_images(swap_chain) }
+            .expect("failed to get swapchain images");
+
+        SwapChainData {
+            swap_chain,
+            format: surface_format.format,
+            extent,
+            images,
+        }
     }
 
     fn choose_swap_surface_format(available_formats: &Vec<SurfaceFormatKHR>) -> SurfaceFormatKHR {
@@ -564,6 +568,41 @@ impl HelloTriangleApplication {
             }
         }
     }
+
+    fn create_image_views(device: &Device, swap_chain_data: &SwapChainData) -> Vec<ImageView> {
+        swap_chain_data
+            .images
+            .iter()
+            .map(|&img| {
+                let create_info = ImageViewCreateInfo {
+                    s_type: StructureType::IMAGE_VIEW_CREATE_INFO,
+                    image: img,
+                    view_type: ImageViewType::TYPE_2D,
+                    format: swap_chain_data.format,
+
+                    components: ComponentMapping {
+                        r: ComponentSwizzle::IDENTITY,
+                        g: ComponentSwizzle::IDENTITY,
+                        b: ComponentSwizzle::IDENTITY,
+                        a: ComponentSwizzle::IDENTITY,
+                    },
+
+                    subresource_range: ImageSubresourceRange {
+                        aspect_mask: ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+
+                    ..Default::default()
+                };
+
+                unsafe { device.create_image_view(&create_info, None) }
+                    .expect("failed to create image view")
+            })
+            .collect()
+    }
 }
 
 impl Drop for HelloTriangleApplication {
@@ -572,6 +611,9 @@ impl Drop for HelloTriangleApplication {
             #[cfg(debug_assertions)]
             ManuallyDrop::drop(&mut self.messenger);
 
+            self.image_views
+                .iter()
+                .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
             Swapchain::new(&self.instance, &self.device)
                 .destroy_swapchain(self.swap_chain_data.swap_chain, None);
             self.device.destroy_device(None);
