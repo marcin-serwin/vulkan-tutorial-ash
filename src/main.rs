@@ -135,7 +135,7 @@ struct InstanceWrapper<'a> {
 
 #[derive(Debug, Default)]
 struct PartialQueueFamilyIndices {
-    graphics_family: Option<usize>,
+    graphics_family: Option<u32>,
 }
 
 impl PartialQueueFamilyIndices {
@@ -148,7 +148,7 @@ impl PartialQueueFamilyIndices {
 
 #[derive(Debug, Default)]
 struct QueueFamilyIndices {
-    graphics_family: usize,
+    graphics_family: u32,
 }
 
 impl<'a> InstanceWrapper<'a> {
@@ -158,6 +158,7 @@ impl<'a> InstanceWrapper<'a> {
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 0, 0),
             p_application_name: APP_NAME.as_ptr(),
+
             s_type: StructureType::APPLICATION_INFO,
             ..Default::default()
         };
@@ -212,16 +213,14 @@ impl<'a> InstanceWrapper<'a> {
                 .into_iter()
                 .enumerate()
                 .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|(index, _)| index)
+                .map(|(index, _)| index as u32)
                 .next(),
         }
     }
 
-    fn pick_physical_device(&self) -> PhysicalDevice {
-        let is_device_suitable = |device: &PhysicalDevice| {
-            let families = self.find_queue_families(device).as_total();
-            families.is_some()
-        };
+    fn pick_physical_device(&self) -> (PhysicalDevice, QueueFamilyIndices) {
+        let is_device_suitable =
+            |device: PhysicalDevice| Some((device, self.find_queue_families(&device).as_total()?));
 
         let devices = unsafe { self.instance.enumerate_physical_devices().unwrap() };
         if devices.is_empty() {
@@ -230,9 +229,39 @@ impl<'a> InstanceWrapper<'a> {
 
         devices
             .into_iter()
-            .filter(is_device_suitable)
-            .next()
+            .find_map(is_device_suitable)
             .expect("failed to find a suitable GPU!")
+    }
+
+    fn create_logical_device(&self) -> ash::Device {
+        let (physical_device, queue_indices) = self.pick_physical_device();
+
+        let queue_create_info = vk::DeviceQueueCreateInfo {
+            queue_count: 1,
+            queue_family_index: queue_indices.graphics_family,
+            p_queue_priorities: &1.0f32,
+
+            s_type: StructureType::DEVICE_QUEUE_CREATE_INFO,
+            ..Default::default()
+        };
+
+        let device_features: vk::PhysicalDeviceFeatures = Default::default();
+
+        let create_info = vk::DeviceCreateInfo {
+            p_queue_create_infos: &queue_create_info,
+            queue_create_info_count: 1,
+
+            p_enabled_features: &device_features,
+
+            s_type: StructureType::DEVICE_CREATE_INFO,
+            ..Default::default()
+        };
+
+        unsafe {
+            self.instance
+                .create_device(physical_device, &create_info, None)
+        }
+        .expect("failed to create logical device!")
     }
 }
 
@@ -253,7 +282,8 @@ fn main() {
     #[cfg(debug_assertions)]
     let _mes = Messenger::new(&entry, &instance.instance);
 
-    instance.pick_physical_device();
+    let device = instance.create_logical_device();
+    unsafe { device.destroy_device(None) };
 
     return;
 
