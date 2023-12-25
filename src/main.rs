@@ -1,12 +1,14 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 
 use ash::extensions::ext::DebugUtils;
 use ash::vk::{
     DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
-    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, PhysicalDevice, StructureType,
+    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, PhysicalDevice, Queue,
+    StructureType,
 };
-use ash::{vk, Entry, Instance};
+use ash::{vk, Device, Entry, Instance};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::window::Window;
@@ -67,28 +69,29 @@ fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
     EXTENSIONS
 }
 
-struct Messenger<'a> {
+struct Messenger {
     debug_utils: DebugUtils,
     messenger: DebugUtilsMessengerEXT,
-    instance: PhantomData<&'a Instance>,
 }
 
-impl<'a> Messenger<'a> {
+impl Messenger {
     unsafe extern "system" fn callback(
         message_severity: DebugUtilsMessageSeverityFlagsEXT,
         _message_type: DebugUtilsMessageTypeFlagsEXT,
         cb_data: *const DebugUtilsMessengerCallbackDataEXT,
         _user_data: *mut c_void,
     ) -> u32 {
-        let message = CStr::from_ptr((*cb_data).p_message);
-        eprintln!("validation callback: {message:?}");
+        let message = CStr::from_ptr((*cb_data).p_message)
+            .to_str()
+            .expect("invalid message received from validation");
+        eprintln!("{message_severity:?}: {message}");
         if message_severity.contains(DebugUtilsMessageSeverityFlagsEXT::ERROR) {
             panic!("Validation error");
         }
         vk::FALSE
     }
 
-    fn new(entry: &'a Entry, instance: &'a Instance) -> Self {
+    unsafe fn new(entry: &Entry, instance: &Instance) -> Self {
         let debug_utils = DebugUtils::new(entry, instance);
         let create_info = vk::DebugUtilsMessengerCreateInfoEXT {
             message_severity: DebugUtilsMessageSeverityFlagsEXT::VERBOSE
@@ -113,24 +116,17 @@ impl<'a> Messenger<'a> {
         Self {
             debug_utils,
             messenger,
-            instance: PhantomData,
         }
     }
 }
 
-impl<'a> Drop for Messenger<'a> {
+impl Drop for Messenger {
     fn drop(&mut self) {
         unsafe {
             self.debug_utils
                 .destroy_debug_utils_messenger(self.messenger, None);
         }
     }
-}
-
-struct InstanceWrapper<'a> {
-    instance: Instance,
-    // debug_info: vk::DebugUtilsMessengerCreateInfoEXT,
-    entry: PhantomData<&'a Entry>,
 }
 
 #[derive(Debug, Default)]
@@ -151,8 +147,32 @@ struct QueueFamilyIndices {
     graphics_family: u32,
 }
 
-impl<'a> InstanceWrapper<'a> {
-    fn new(entry: &'a Entry) -> Self {
+struct HelloTriangleApplication {
+    instance: Instance,
+    device: Device,
+    queue: Queue,
+
+    #[cfg(debug_assertions)]
+    messenger: ManuallyDrop<Messenger>,
+}
+
+impl<'a> HelloTriangleApplication {
+    fn new(entry: Entry) -> Self {
+        let instance = HelloTriangleApplication::create_instance(&entry);
+        #[cfg(debug_assertions)]
+        let messenger = ManuallyDrop::new(unsafe { Messenger::new(&entry, &instance) });
+        let (device, queue) = HelloTriangleApplication::create_logical_device(&instance);
+
+        Self {
+            instance,
+            device,
+            queue,
+            #[cfg(debug_assertions)]
+            messenger,
+        }
+    }
+
+    fn create_instance(entry: &Entry) -> Instance {
         const APP_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"MyTest\0") };
 
         let app_info = vk::ApplicationInfo {
@@ -196,45 +216,12 @@ impl<'a> InstanceWrapper<'a> {
 
         // let exts = entry.enumerate_instance_extension_properties(None).unwrap();
 
-        Self {
-            instance: unsafe { entry.create_instance(&create_info, None).unwrap() },
-            entry: PhantomData,
-        }
+        unsafe { entry.create_instance(&create_info, None).unwrap() }
     }
 
-    fn find_queue_families(&self, device: &PhysicalDevice) -> PartialQueueFamilyIndices {
-        let props = unsafe {
-            self.instance
-                .get_physical_device_queue_family_properties(*device)
-        };
-
-        PartialQueueFamilyIndices {
-            graphics_family: props
-                .into_iter()
-                .enumerate()
-                .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|(index, _)| index as u32)
-                .next(),
-        }
-    }
-
-    fn pick_physical_device(&self) -> (PhysicalDevice, QueueFamilyIndices) {
-        let is_device_suitable =
-            |device: PhysicalDevice| Some((device, self.find_queue_families(&device).as_total()?));
-
-        let devices = unsafe { self.instance.enumerate_physical_devices().unwrap() };
-        if devices.is_empty() {
-            panic!("failed to find GPUs with Vulkan support!");
-        }
-
-        devices
-            .into_iter()
-            .find_map(is_device_suitable)
-            .expect("failed to find a suitable GPU!")
-    }
-
-    fn create_logical_device(&self) -> ash::Device {
-        let (physical_device, queue_indices) = self.pick_physical_device();
+    fn create_logical_device(instance: &Instance) -> (Device, Queue) {
+        let (physical_device, queue_indices) =
+            HelloTriangleApplication::pick_physical_device(instance);
 
         let queue_create_info = vk::DeviceQueueCreateInfo {
             queue_count: 1,
@@ -257,17 +244,55 @@ impl<'a> InstanceWrapper<'a> {
             ..Default::default()
         };
 
-        unsafe {
-            self.instance
-                .create_device(physical_device, &create_info, None)
+        let device = unsafe { instance.create_device(physical_device, &create_info, None) }
+            .expect("failed to create logical device!");
+        let queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
+
+        (device, queue)
+    }
+
+    fn find_queue_families(
+        instance: &Instance,
+        device: &PhysicalDevice,
+    ) -> PartialQueueFamilyIndices {
+        let props = unsafe { instance.get_physical_device_queue_family_properties(*device) };
+
+        PartialQueueFamilyIndices {
+            graphics_family: props
+                .into_iter()
+                .enumerate()
+                .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|(index, _)| index as u32)
+                .next(),
         }
-        .expect("failed to create logical device!")
+    }
+
+    fn pick_physical_device(instance: &Instance) -> (PhysicalDevice, QueueFamilyIndices) {
+        let is_device_suitable = |device: PhysicalDevice| {
+            Some((
+                device,
+                HelloTriangleApplication::find_queue_families(instance, &device).as_total()?,
+            ))
+        };
+
+        let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
+        if devices.is_empty() {
+            panic!("failed to find GPUs with Vulkan support!");
+        }
+
+        devices
+            .into_iter()
+            .find_map(is_device_suitable)
+            .expect("failed to find a suitable GPU!")
     }
 }
 
-impl<'a> Drop for InstanceWrapper<'a> {
+impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         unsafe {
+            #[cfg(debug_assertions)]
+            ManuallyDrop::drop(&mut self.messenger);
+            self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
@@ -278,12 +303,7 @@ fn main() {
     let window = Window::new(&event_loop).unwrap();
 
     let entry = Entry::linked();
-    let instance = InstanceWrapper::new(&entry);
-    #[cfg(debug_assertions)]
-    let _mes = Messenger::new(&entry, &instance.instance);
-
-    let device = instance.create_logical_device();
-    unsafe { device.destroy_device(None) };
+    let _app = HelloTriangleApplication::new(entry);
 
     return;
 
