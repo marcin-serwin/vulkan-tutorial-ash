@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use ash::extensions::ext::DebugUtils;
 use ash::vk::{
     DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
-    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, StructureType,
+    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, PhysicalDevice, StructureType,
 };
 use ash::{vk, Entry, Instance};
 use winit::event::{Event, WindowEvent};
@@ -133,6 +133,24 @@ struct InstanceWrapper<'a> {
     entry: PhantomData<&'a Entry>,
 }
 
+#[derive(Debug, Default)]
+struct PartialQueueFamilyIndices {
+    graphics_family: Option<usize>,
+}
+
+impl PartialQueueFamilyIndices {
+    fn as_total(self) -> Option<QueueFamilyIndices> {
+        Some(QueueFamilyIndices {
+            graphics_family: self.graphics_family?,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueueFamilyIndices {
+    graphics_family: usize,
+}
+
 impl<'a> InstanceWrapper<'a> {
     fn new(entry: &'a Entry) -> Self {
         const APP_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"MyTest\0") };
@@ -182,6 +200,40 @@ impl<'a> InstanceWrapper<'a> {
             entry: PhantomData,
         }
     }
+
+    fn find_queue_families(&self, device: &PhysicalDevice) -> PartialQueueFamilyIndices {
+        let props = unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(*device)
+        };
+
+        PartialQueueFamilyIndices {
+            graphics_family: props
+                .into_iter()
+                .enumerate()
+                .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|(index, _)| index)
+                .next(),
+        }
+    }
+
+    fn pick_physical_device(&self) -> PhysicalDevice {
+        let is_device_suitable = |device: &PhysicalDevice| {
+            let families = self.find_queue_families(device).as_total();
+            families.is_some()
+        };
+
+        let devices = unsafe { self.instance.enumerate_physical_devices().unwrap() };
+        if devices.is_empty() {
+            panic!("failed to find GPUs with Vulkan support!");
+        }
+
+        devices
+            .into_iter()
+            .filter(is_device_suitable)
+            .next()
+            .expect("failed to find a suitable GPU!")
+    }
 }
 
 impl<'a> Drop for InstanceWrapper<'a> {
@@ -200,6 +252,8 @@ fn main() {
     let instance = InstanceWrapper::new(&entry);
     #[cfg(debug_assertions)]
     let _mes = Messenger::new(&entry, &instance.instance);
+
+    instance.pick_physical_device();
 
     return;
 
