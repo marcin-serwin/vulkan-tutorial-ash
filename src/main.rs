@@ -4,8 +4,7 @@ use std::marker::PhantomData;
 use ash::extensions::ext::DebugUtils;
 use ash::vk::{
     DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
-    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerCreateInfoEXT, DebugUtilsMessengerEXT,
-    StructureType,
+    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, StructureType,
 };
 use ash::{vk, Entry, Instance};
 use winit::event::{Event, WindowEvent};
@@ -17,13 +16,14 @@ unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
 }
 
 #[cfg(not(debug_assertions))]
-fn get_validation_layers(entry: &Entry) -> [*const c_char; 0] {
-    []
-}
-
+const LAYERS: [&CStr; 0] = [];
 #[cfg(debug_assertions)]
-fn get_validation_layers(entry: &Entry) -> [*const c_char; 1] {
-    let layers = [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
+const LAYERS: [&CStr; 1] =
+    [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
+fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
+    if LAYERS.is_empty() {
+        return LAYERS;
+    }
     let supported_layers = entry.enumerate_instance_layer_properties().unwrap();
 
     let names: Vec<&CStr> = supported_layers
@@ -31,29 +31,40 @@ fn get_validation_layers(entry: &Entry) -> [*const c_char; 1] {
         .map(|layer| unsafe { name_to_cstr(&layer.layer_name) })
         .collect();
 
-    if layers.iter().any(|ext| !names.contains(ext)) {
+    if LAYERS.iter().any(|ext| !names.contains(ext)) {
         panic!("Required validation layer not found");
     }
 
-    layers.map(|name| name.as_ptr())
+    LAYERS
 }
 
-fn get_extensions(entry: &Entry) -> Vec<*const c_char> {
-    let mut extensions = vec![vk::KhrPortabilityEnumerationFn::name()];
-    #[cfg(debug_assertions)]
-    extensions.push(vk::ExtDebugUtilsFn::name());
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+const EXTENSIONS: [&CStr; 0] = [];
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+const EXTENSIONS: [&CStr; 1] = [vk::KhrPortabilityEnumerationFn::name()];
+#[cfg(all(target_os = "linux", debug_assertions))]
+const EXTENSIONS: [&CStr; 1] = [vk::ExtDebugUtilsFn::name()];
+#[cfg(all(target_os = "macos", debug_assertions))]
+const EXTENSIONS: [&CStr; 2] = [
+    vk::KhrPortabilityEnumerationFn::name(),
+    vk::ExtDebugUtilsFn::name(),
+];
 
+fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
+    if EXTENSIONS.is_empty() {
+        return EXTENSIONS;
+    }
     let supported_extensions = entry.enumerate_instance_extension_properties(None).unwrap();
     let names: Vec<&CStr> = supported_extensions
         .iter()
         .map(|ext| unsafe { name_to_cstr(&ext.extension_name) })
         .collect();
 
-    if extensions.iter().any(|ext| !names.contains(ext)) {
+    if EXTENSIONS.iter().any(|ext| !names.contains(ext)) {
         panic!("Required extension not found");
     }
 
-    extensions.into_iter().map(|name| name.as_ptr()).collect()
+    EXTENSIONS
 }
 
 struct Messenger<'a> {
@@ -64,14 +75,14 @@ struct Messenger<'a> {
 
 impl<'a> Messenger<'a> {
     unsafe extern "system" fn callback(
-        _message_severity: DebugUtilsMessageSeverityFlagsEXT,
+        message_severity: DebugUtilsMessageSeverityFlagsEXT,
         _message_type: DebugUtilsMessageTypeFlagsEXT,
         cb_data: *const DebugUtilsMessengerCallbackDataEXT,
         _user_data: *mut c_void,
     ) -> u32 {
         let message = CStr::from_ptr((*cb_data).p_message);
         eprintln!("validation callback: {message:?}");
-        if _message_severity.contains(DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        if message_severity.contains(DebugUtilsMessageSeverityFlagsEXT::ERROR) {
             panic!("Validation error");
         }
         vk::FALSE
@@ -124,9 +135,11 @@ struct InstanceWrapper<'a> {
 
 impl<'a> InstanceWrapper<'a> {
     fn new(entry: &'a Entry) -> Self {
+        const APP_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"MyTest\0") };
+
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 0, 0),
-            p_application_name: "MyTest\0".as_ptr() as *const c_char,
+            p_application_name: APP_NAME.as_ptr(),
             s_type: StructureType::APPLICATION_INFO,
             ..Default::default()
         };
@@ -151,13 +164,14 @@ impl<'a> InstanceWrapper<'a> {
 
         let create_info = vk::InstanceCreateInfo {
             p_application_info: &app_info,
-            pp_enabled_extension_names: extensions.as_ptr(),
+            pp_enabled_extension_names: extensions.map(CStr::as_ptr).as_ptr(),
             enabled_extension_count: extensions.len() as u32,
-            flags: vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
-            pp_enabled_layer_names: validation_layers.as_ptr(),
+            pp_enabled_layer_names: validation_layers.map(CStr::as_ptr).as_ptr(),
             enabled_layer_count: validation_layers.len() as u32,
             #[cfg(debug_assertions)]
             p_next: &debug_create_info as *const _ as *const c_void,
+            #[cfg(target_os = "macos")]
+            flags: vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
             ..Default::default()
         };
 
@@ -185,7 +199,7 @@ fn main() {
     let entry = Entry::linked();
     let instance = InstanceWrapper::new(&entry);
     #[cfg(debug_assertions)]
-    let mes = Messenger::new(&entry, &instance.instance);
+    let _mes = Messenger::new(&entry, &instance.instance);
 
     return;
 
