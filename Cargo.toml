@@ -8,4 +8,4 @@ edition = "2021"
 [dependencies]
 ash = { version = "0.37.3", features = ["linked"] }
 glm = "0.2.3"
-winit = "0.29.3"
+winit = "0.29.6"
