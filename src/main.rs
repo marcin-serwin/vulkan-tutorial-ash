@@ -1,5 +1,5 @@
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
-use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 
 use ash::extensions::ext::DebugUtils;
@@ -11,6 +11,10 @@ use ash::vk::{
 use ash::{vk, Device, Entry, Instance};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
+use winit::raw_window_handle::{
+    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle,
+    WaylandWindowHandle,
+};
 use winit::window::Window;
 
 unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
@@ -41,11 +45,15 @@ fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
 }
 
 #[cfg(all(target_os = "linux", not(debug_assertions)))]
-const EXTENSIONS: [&CStr; 0] = [];
+const EXTENSIONS: [&CStr; 2] = [vk::KhrSurfaceFn::name(), vk::KhrWaylandSurfaceFn::name()];
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 const EXTENSIONS: [&CStr; 1] = [vk::KhrPortabilityEnumerationFn::name()];
 #[cfg(all(target_os = "linux", debug_assertions))]
-const EXTENSIONS: [&CStr; 1] = [vk::ExtDebugUtilsFn::name()];
+const EXTENSIONS: [&CStr; 3] = [
+    vk::KhrSurfaceFn::name(),
+    vk::KhrWaylandSurfaceFn::name(),
+    vk::ExtDebugUtilsFn::name(),
+];
 #[cfg(all(target_os = "macos", debug_assertions))]
 const EXTENSIONS: [&CStr; 2] = [
     vk::KhrPortabilityEnumerationFn::name(),
@@ -132,12 +140,18 @@ impl Drop for Messenger {
 #[derive(Debug, Default)]
 struct PartialQueueFamilyIndices {
     graphics_family: Option<u32>,
+    present_family: Option<u32>,
 }
 
 impl PartialQueueFamilyIndices {
-    fn as_total(self) -> Option<QueueFamilyIndices> {
+    fn is_total(&self) -> bool {
+        self.as_total().is_some()
+    }
+
+    fn as_total(&self) -> Option<QueueFamilyIndices> {
         Some(QueueFamilyIndices {
             graphics_family: self.graphics_family?,
+            present_family: self.present_family?,
         })
     }
 }
@@ -145,31 +159,81 @@ impl PartialQueueFamilyIndices {
 #[derive(Debug, Default)]
 struct QueueFamilyIndices {
     graphics_family: u32,
+    present_family: u32,
 }
 
 struct HelloTriangleApplication {
+    entry: Entry,
     instance: Instance,
+    surface: vk::SurfaceKHR,
     device: Device,
-    queue: Queue,
+    graphics_queue: Queue,
+    present_queue: Queue,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
 }
 
 impl<'a> HelloTriangleApplication {
-    fn new(entry: Entry) -> Self {
-        let instance = HelloTriangleApplication::create_instance(&entry);
+    fn new(entry: Entry, window: &Window) -> Self {
+        let instance = Self::create_instance(&entry);
         #[cfg(debug_assertions)]
         let messenger = ManuallyDrop::new(unsafe { Messenger::new(&entry, &instance) });
-        let (device, queue) = HelloTriangleApplication::create_logical_device(&instance);
+        let surface = Self::create_surface(&entry, &instance, window);
+        let (device, graphics_queue, present_queue) =
+            Self::create_logical_device(&entry, &instance, &surface);
 
         Self {
+            entry,
             instance,
+            surface,
             device,
-            queue,
+            graphics_queue,
+            present_queue,
+
             #[cfg(debug_assertions)]
             messenger,
         }
+    }
+
+    fn create_surface(entry: &Entry, instance: &Instance, window: &Window) -> vk::SurfaceKHR {
+        let window_handle = window
+            .window_handle()
+            .expect("failed to get window handle")
+            .as_raw();
+        let display_handle = window
+            .display_handle()
+            .expect("failed to get display handle")
+            .as_raw();
+
+        match (window_handle, display_handle) {
+            (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) => {
+                Self::create_wayland_surface(&entry, &instance, &window, &display)
+            }
+
+            _ => panic!("unsupported windowing system"),
+        }
+    }
+
+    fn create_wayland_surface(
+        entry: &Entry,
+        instance: &Instance,
+        window_handle: &WaylandWindowHandle,
+        display_handle: &WaylandDisplayHandle,
+    ) -> vk::SurfaceKHR {
+        use ash::extensions::khr::WaylandSurface;
+        let surface = WaylandSurface::new(&entry, &instance);
+
+        let create_info = vk::WaylandSurfaceCreateInfoKHR {
+            s_type: StructureType::WAYLAND_SURFACE_CREATE_INFO_KHR,
+            display: display_handle.display.as_ptr(),
+            surface: window_handle.surface.as_ptr(),
+            ..Default::default()
+        };
+
+        let surface = unsafe { surface.create_wayland_surface(&create_info, None) }
+            .expect("failed to create wayland surface");
+        surface
     }
 
     fn create_instance(entry: &Entry) -> Instance {
@@ -219,24 +283,38 @@ impl<'a> HelloTriangleApplication {
         unsafe { entry.create_instance(&create_info, None).unwrap() }
     }
 
-    fn create_logical_device(instance: &Instance) -> (Device, Queue) {
+    fn create_logical_device(
+        entry: &Entry,
+        instance: &Instance,
+        surface: &vk::SurfaceKHR,
+    ) -> (Device, Queue, Queue) {
         let (physical_device, queue_indices) =
-            HelloTriangleApplication::pick_physical_device(instance);
+            HelloTriangleApplication::pick_physical_device(entry, instance, surface);
 
-        let queue_create_info = vk::DeviceQueueCreateInfo {
-            queue_count: 1,
-            queue_family_index: queue_indices.graphics_family,
-            p_queue_priorities: &1.0f32,
-
-            s_type: StructureType::DEVICE_QUEUE_CREATE_INFO,
-            ..Default::default()
+        let unique_indices = {
+            let mut set = HashSet::new();
+            set.insert(queue_indices.graphics_family);
+            set.insert(queue_indices.present_family);
+            set
         };
+
+        let queue_create_infos: Vec<_> = unique_indices
+            .into_iter()
+            .map(|index| vk::DeviceQueueCreateInfo {
+                queue_count: 1,
+                queue_family_index: index,
+                p_queue_priorities: &1.0f32,
+
+                s_type: StructureType::DEVICE_QUEUE_CREATE_INFO,
+                ..Default::default()
+            })
+            .collect();
 
         let device_features: vk::PhysicalDeviceFeatures = Default::default();
 
         let create_info = vk::DeviceCreateInfo {
-            p_queue_create_infos: &queue_create_info,
-            queue_create_info_count: 1,
+            p_queue_create_infos: queue_create_infos.as_ptr(),
+            queue_create_info_count: queue_create_infos.len() as u32,
 
             p_enabled_features: &device_features,
 
@@ -246,32 +324,56 @@ impl<'a> HelloTriangleApplication {
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .expect("failed to create logical device!");
-        let queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
+        let graphics_queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
+        let present_queue = unsafe { device.get_device_queue(queue_indices.present_family, 0) };
 
-        (device, queue)
+        (device, graphics_queue, present_queue)
     }
 
     fn find_queue_families(
+        entry: &Entry,
         instance: &Instance,
         device: &PhysicalDevice,
+        surface: &vk::SurfaceKHR,
     ) -> PartialQueueFamilyIndices {
+        use ash::extensions::khr::Surface;
+        let surface_fn = Surface::new(&entry, &instance);
+
         let props = unsafe { instance.get_physical_device_queue_family_properties(*device) };
 
-        PartialQueueFamilyIndices {
-            graphics_family: props
-                .into_iter()
-                .enumerate()
-                .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|(index, _)| index as u32)
-                .next(),
+        let mut result: PartialQueueFamilyIndices = Default::default();
+
+        for (index, queue) in props.into_iter().enumerate() {
+            let index = index as u32;
+            if queue.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                result.graphics_family = Some(index);
+            }
+            if unsafe {
+                surface_fn
+                    .get_physical_device_surface_support(*device, index, *surface)
+                    .unwrap_or(false)
+            } {
+                result.present_family = Some(index);
+            }
+
+            if result.is_total() {
+                break;
+            }
         }
+
+        result
     }
 
-    fn pick_physical_device(instance: &Instance) -> (PhysicalDevice, QueueFamilyIndices) {
+    fn pick_physical_device(
+        entry: &Entry,
+        instance: &Instance,
+        surface: &vk::SurfaceKHR,
+    ) -> (PhysicalDevice, QueueFamilyIndices) {
         let is_device_suitable = |device: PhysicalDevice| {
             Some((
                 device,
-                HelloTriangleApplication::find_queue_families(instance, &device).as_total()?,
+                HelloTriangleApplication::find_queue_families(entry, instance, &device, surface)
+                    .as_total()?,
             ))
         };
 
@@ -289,10 +391,13 @@ impl<'a> HelloTriangleApplication {
 
 impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
+        use ash::extensions::khr::Surface;
+        let surface = Surface::new(&self.entry, &self.instance);
         unsafe {
             #[cfg(debug_assertions)]
             ManuallyDrop::drop(&mut self.messenger);
             self.device.destroy_device(None);
+            surface.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
     }
@@ -303,7 +408,8 @@ fn main() {
     let window = Window::new(&event_loop).unwrap();
 
     let entry = Entry::linked();
-    let _app = HelloTriangleApplication::new(entry);
+
+    let _app = HelloTriangleApplication::new(entry, &window);
 
     return;
 
