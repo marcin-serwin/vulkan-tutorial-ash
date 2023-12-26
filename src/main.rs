@@ -197,6 +197,8 @@ struct HelloTriangleApplication {
     queue_family: QueueFamily,
     swap_chain_data: SwapChainData,
     image_views: Vec<ImageView>,
+
+    render_pass: RenderPass,
     pipeline_layout: PipelineLayout,
 
     #[cfg(debug_assertions)]
@@ -225,6 +227,7 @@ impl HelloTriangleApplication {
         );
         let image_views = Self::create_image_views(&device, &swap_chain_data);
 
+        let render_pass = Self::create_render_pass(&device, &swap_chain_data);
         let pipeline_layout = Self::create_graphics_pipeline(&device, &swap_chain_data);
 
         Self {
@@ -235,6 +238,7 @@ impl HelloTriangleApplication {
             queue_family,
             swap_chain_data,
             image_views,
+            render_pass,
             pipeline_layout,
 
             #[cfg(debug_assertions)]
@@ -733,6 +737,50 @@ impl HelloTriangleApplication {
         unsafe { device.create_shader_module(&create_info, None) }
             .expect("failed to create shader module")
     }
+
+    fn create_render_pass(device: &Device, swap_chain_data: &SwapChainData) -> RenderPass {
+        let color_attachments = [AttachmentDescription {
+            format: swap_chain_data.format,
+            samples: SampleCountFlags::TYPE_1,
+
+            load_op: AttachmentLoadOp::CLEAR,
+            store_op: AttachmentStoreOp::STORE,
+
+            stencil_load_op: AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: AttachmentStoreOp::DONT_CARE,
+
+            initial_layout: ImageLayout::UNDEFINED,
+            final_layout: ImageLayout::PRESENT_SRC_KHR,
+
+            ..Default::default()
+        }];
+
+        let color_attachment_refs = [AttachmentReference {
+            attachment: 0,
+            layout: ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+
+        let subpasses = [SubpassDescription {
+            pipeline_bind_point: PipelineBindPoint::GRAPHICS,
+            color_attachment_count: color_attachment_refs.len() as u32,
+            p_color_attachments: color_attachment_refs.as_ptr(),
+
+            ..Default::default()
+        }];
+
+        let render_pass_create_info = RenderPassCreateInfo {
+            attachment_count: color_attachments.len() as u32,
+            p_attachments: color_attachments.as_ptr(),
+
+            subpass_count: subpasses.len() as u32,
+            p_subpasses: subpasses.as_ptr(),
+
+            ..Default::default()
+        };
+
+        unsafe { device.create_render_pass(&render_pass_create_info, None) }
+            .expect("failed to create render pass!")
+    }
 }
 
 impl Drop for HelloTriangleApplication {
@@ -743,6 +791,7 @@ impl Drop for HelloTriangleApplication {
 
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_render_pass(self.render_pass, None);
             self.image_views
                 .iter()
                 .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
