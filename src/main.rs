@@ -194,6 +194,7 @@ struct HelloTriangleApplication {
     instance: Instance,
     surface: SurfaceKHR,
     device: Device,
+
     queue_family: QueueFamily,
     swap_chain_data: SwapChainData,
     image_views: Vec<ImageView>,
@@ -201,6 +202,8 @@ struct HelloTriangleApplication {
     render_pass: RenderPass,
     pipeline_layout: PipelineLayout,
     pipeline: Pipeline,
+
+    framebuffers: Vec<Framebuffer>,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -232,17 +235,25 @@ impl HelloTriangleApplication {
         let (pipeline, pipeline_layout) =
             Self::create_graphics_pipeline(&device, &swap_chain_data, render_pass);
 
+        let framebuffers =
+            Self::create_framebuffers(&device, &swap_chain_data, &image_views, render_pass);
+
         Self {
             entry,
             instance,
             surface,
             device,
+
             queue_family,
             swap_chain_data,
             image_views,
+
             render_pass,
+
             pipeline_layout,
             pipeline,
+
+            framebuffers,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -810,18 +821,53 @@ impl HelloTriangleApplication {
         unsafe { device.create_render_pass(&render_pass_create_info, None) }
             .expect("failed to create render pass!")
     }
+
+    fn create_framebuffers(
+        device: &Device,
+        swap_chain_data: &SwapChainData,
+        image_views: &Vec<ImageView>,
+        render_pass: RenderPass,
+    ) -> Vec<Framebuffer> {
+        image_views
+            .iter()
+            .enumerate()
+            .map(|(index, &img_view)| {
+                let attachments = [img_view];
+
+                let framebuffer_info = FramebufferCreateInfo {
+                    render_pass,
+                    attachment_count: attachments.len() as u32,
+                    p_attachments: attachments.as_ptr(),
+                    width: swap_chain_data.extent.width,
+                    height: swap_chain_data.extent.height,
+                    layers: 1,
+
+                    ..Default::default()
+                };
+
+                unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                    .expect("failed to create framebuffer!")
+            })
+            .collect()
+    }
 }
 
 impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         unsafe {
+            self.framebuffers
+                .iter()
+                .for_each(|&fbuf| self.device.destroy_framebuffer(fbuf, None));
+
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
+
             self.image_views
                 .iter()
                 .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
+
             Swapchain::new(&self.instance, &self.device)
                 .destroy_swapchain(self.swap_chain_data.swap_chain, None);
             self.device.destroy_device(None);
