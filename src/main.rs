@@ -31,6 +31,8 @@ unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
     CStr::from_bytes_until_nul(std::mem::transmute(name)).unwrap_unchecked()
 }
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
 const DEVICE_EXTENSIONS: [&CStr; 1] = [KhrSwapchainFn::name()];
 
 #[cfg(not(debug_assertions))]
@@ -190,6 +192,12 @@ struct SwapChainData {
     extent: Extent2D,
 }
 
+struct SyncObjects {
+    image_available_semaphores: [Semaphore; MAX_FRAMES_IN_FLIGHT],
+    render_finished_semaphores: [Semaphore; MAX_FRAMES_IN_FLIGHT],
+    in_flight_fences: [Fence; MAX_FRAMES_IN_FLIGHT],
+}
+
 struct HelloTriangleApplication {
     entry: Entry,
     instance: Instance,
@@ -207,11 +215,10 @@ struct HelloTriangleApplication {
     framebuffers: Vec<Framebuffer>,
 
     command_pool: CommandPool,
-    command_buffer: CommandBuffer,
+    command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
 
-    image_available: Semaphore,
-    render_finished: Semaphore,
-    in_flight: Fence,
+    sync_objects: SyncObjects,
+    current_frame: usize,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -246,9 +253,9 @@ impl HelloTriangleApplication {
             Self::create_framebuffers(&device, &swap_chain, &image_views, render_pass);
 
         let command_pool = Self::create_command_pool(&device, &queue_indices);
-        let command_buffer = Self::create_command_buffer(&device, command_pool);
+        let command_buffers = Self::create_command_buffers(&device, command_pool);
 
-        let (image_available, render_finished, in_flight) = Self::create_sync_objects(&device);
+        let sync_objects = Self::create_sync_objects(&device);
 
         Self {
             entry,
@@ -268,25 +275,29 @@ impl HelloTriangleApplication {
             framebuffers,
 
             command_pool,
-            command_buffer,
+            command_buffers,
 
-            image_available,
-            render_finished,
-            in_flight,
+            sync_objects,
+            current_frame: 0,
 
             #[cfg(debug_assertions)]
             messenger,
         }
     }
 
-    fn draw_frame(&self) {
+    fn draw_frame(&mut self) {
+        let in_flight = self.sync_objects.in_flight_fences[self.current_frame];
+        let img_available = self.sync_objects.image_available_semaphores[self.current_frame];
+        let render_finished = self.sync_objects.render_finished_semaphores[self.current_frame];
+        let command_buffer = self.command_buffers[self.current_frame];
+
         unsafe {
             self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .wait_for_fences(&[in_flight], true, u64::MAX)
                 .expect("failed to wait for fence");
 
             self.device
-                .reset_fences(&[self.in_flight])
+                .reset_fences(&[in_flight])
                 .expect("failed to reset fence");
         }
 
@@ -296,7 +307,7 @@ impl HelloTriangleApplication {
                 .acquire_next_image(
                     self.swap_chain.chain,
                     u64::MAX,
-                    self.image_available,
+                    img_available,
                     Fence::null(),
                 )
                 .expect("failed to acquire next image from swap chain")
@@ -305,16 +316,16 @@ impl HelloTriangleApplication {
 
         unsafe {
             self.device
-                .reset_command_buffer(self.command_buffer, CommandBufferResetFlags::empty())
+                .reset_command_buffer(command_buffer, CommandBufferResetFlags::empty())
                 .expect("failed to reset command buffer");
 
-            self.record_command_buffer(image_index);
+            self.record_command_buffer(command_buffer, image_index);
         }
 
-        let wait_semaphores = [self.image_available];
+        let wait_semaphores = [img_available];
         let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let cmd_buffers = [self.command_buffer];
-        let signal_semaphores = [self.render_finished];
+        let cmd_buffers = [command_buffer];
+        let signal_semaphores = [render_finished];
 
         let submit_info = SubmitInfo::builder()
             .wait_semaphores(&wait_semaphores)
@@ -324,11 +335,7 @@ impl HelloTriangleApplication {
 
         unsafe {
             self.device
-                .queue_submit(
-                    self.queue_family.graphics_queue,
-                    &[*submit_info],
-                    self.in_flight,
-                )
+                .queue_submit(self.queue_family.graphics_queue, &[*submit_info], in_flight)
                 .expect("failed to submit draw command buffer!")
         };
 
@@ -345,6 +352,7 @@ impl HelloTriangleApplication {
                 .queue_present(self.queue_family.present_queue, &present_info)
                 .expect("failed to present queue");
         }
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     fn create_surface(entry: &Entry, instance: &Instance, window: &Window) -> SurfaceKHR {
@@ -949,25 +957,29 @@ impl HelloTriangleApplication {
             .expect("failed to create framebuffer!")
     }
 
-    fn create_command_buffer(device: &Device, command_pool: CommandPool) -> CommandBuffer {
+    fn create_command_buffers(
+        device: &Device,
+        command_pool: CommandPool,
+    ) -> [CommandBuffer; MAX_FRAMES_IN_FLIGHT] {
         let alloc_info = CommandBufferAllocateInfo {
             command_pool,
             level: CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-
+            command_buffer_count: MAX_FRAMES_IN_FLIGHT as u32,
             ..Default::default()
         };
 
         unsafe { device.allocate_command_buffers(&alloc_info) }
-            .expect("failed to allocate command buffers!")[0]
+            .expect("failed to allocate command buffers!")
+            .try_into()
+            .expect("incorrect number of buffers returned")
     }
 
-    fn record_command_buffer(&self, image_index: u32) {
+    fn record_command_buffer(&self, command_buffer: CommandBuffer, image_index: u32) {
         let begin_info = CommandBufferBeginInfo::default();
 
         unsafe {
             self.device
-                .begin_command_buffer(self.command_buffer, &begin_info)
+                .begin_command_buffer(command_buffer, &begin_info)
         }
         .expect("failed to allocate command buffers!");
 
@@ -1007,49 +1019,52 @@ impl HelloTriangleApplication {
 
         unsafe {
             self.device.cmd_begin_render_pass(
-                self.command_buffer,
+                command_buffer,
                 &render_pass_info,
                 SubpassContents::INLINE,
             );
 
             self.device.cmd_bind_pipeline(
-                self.command_buffer,
+                command_buffer,
                 PipelineBindPoint::GRAPHICS,
                 self.pipeline,
             );
 
-            self.device
-                .cmd_set_viewport(self.command_buffer, 0, &viewports);
-            self.device
-                .cmd_set_scissor(self.command_buffer, 0, &scissors);
-            self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
-            self.device.cmd_end_render_pass(self.command_buffer);
+            self.device.cmd_set_viewport(command_buffer, 0, &viewports);
+            self.device.cmd_set_scissor(command_buffer, 0, &scissors);
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(command_buffer);
 
             self.device
-                .end_command_buffer(self.command_buffer)
+                .end_command_buffer(command_buffer)
                 .expect("failed to record command buffer!");
         }
     }
 
-    fn create_sync_objects(device: &Device) -> (Semaphore, Semaphore, Fence) {
+    fn create_sync_objects(device: &Device) -> SyncObjects {
         let semaphore_info = SemaphoreCreateInfo::default();
         let fence_info = FenceCreateInfo {
             flags: FenceCreateFlags::SIGNALED,
 
             ..Default::default()
         };
-        unsafe {
-            (
-                device
-                    .create_semaphore(&semaphore_info, None)
-                    .expect("failed to create semaphore"),
-                device
-                    .create_semaphore(&semaphore_info, None)
-                    .expect("failed to create semaphore"),
-                device
-                    .create_fence(&fence_info, None)
-                    .expect("failed to create fence"),
-            )
+
+        const UNIT_ARRAY: [(); MAX_FRAMES_IN_FLIGHT] = [(); MAX_FRAMES_IN_FLIGHT];
+        let semaphore_init = |_| unsafe {
+            device
+                .create_semaphore(&semaphore_info, None)
+                .expect("failed to create semaphore")
+        };
+        let fence_init = |_| unsafe {
+            device
+                .create_fence(&fence_info, None)
+                .expect("failed to create fence")
+        };
+
+        SyncObjects {
+            image_available_semaphores: UNIT_ARRAY.map(semaphore_init),
+            render_finished_semaphores: UNIT_ARRAY.map(semaphore_init),
+            in_flight_fences: UNIT_ARRAY.map(fence_init),
         }
     }
 }
@@ -1061,9 +1076,16 @@ impl Drop for HelloTriangleApplication {
                 .device_wait_idle()
                 .expect("failed while waiting for device idle");
 
-            self.device.destroy_semaphore(self.image_available, None);
-            self.device.destroy_semaphore(self.render_finished, None);
-            self.device.destroy_fence(self.in_flight, None);
+            self.sync_objects
+                .image_available_semaphores
+                .iter()
+                .chain(self.sync_objects.render_finished_semaphores.iter())
+                .for_each(|&sem| self.device.destroy_semaphore(sem, None));
+
+            self.sync_objects
+                .in_flight_fences
+                .iter()
+                .for_each(|&fence| self.device.destroy_fence(fence, None));
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
@@ -1099,7 +1121,7 @@ fn main() {
 
     let entry = Entry::linked();
 
-    let app = HelloTriangleApplication::new(entry, &window);
+    let mut app = HelloTriangleApplication::new(entry, &window);
 
     let mat = glm::mat2(1., 2., 3., 4.);
     let v = glm::vec2(1., 2.);
