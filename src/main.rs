@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
-#[cfg_attr(not(debug_assertions), allow(unused_imports))]
+#[cfg(debug_assertions)]
 use std::mem::ManuallyDrop;
 
 use ash::extensions::ext::DebugUtils;
@@ -19,13 +19,16 @@ macro_rules! include_shader {
     };
 }
 
-unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
-    return CStr::from_ptr(name.as_ptr());
-}
 macro_rules! cstr {
-    ($str:literal) => {
-        unsafe { CStr::from_bytes_with_nul_unchecked(concat!($str, "\0").as_bytes()) }
-    };
+    ($str:literal) => {{
+        const RESULT: &CStr =
+            unsafe { CStr::from_bytes_with_nul_unchecked(concat!($str, "\0").as_bytes()) };
+        RESULT
+    }};
+}
+
+unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
+    CStr::from_bytes_until_nul(std::mem::transmute(name)).unwrap_unchecked()
 }
 
 const DEVICE_EXTENSIONS: [&CStr; 1] = [KhrSwapchainFn::name()];
@@ -194,6 +197,7 @@ struct HelloTriangleApplication {
     queue_family: QueueFamily,
     swap_chain_data: SwapChainData,
     image_views: Vec<ImageView>,
+    pipeline_layout: PipelineLayout,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -221,7 +225,7 @@ impl HelloTriangleApplication {
         );
         let image_views = Self::create_image_views(&device, &swap_chain_data);
 
-        let shaders = Self::create_graphics_pipeline(&device);
+        let pipeline_layout = Self::create_graphics_pipeline(&device, &swap_chain_data);
 
         Self {
             entry,
@@ -231,6 +235,7 @@ impl HelloTriangleApplication {
             queue_family,
             swap_chain_data,
             image_views,
+            pipeline_layout,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -265,7 +270,6 @@ impl HelloTriangleApplication {
         let surface = WaylandSurface::new(&entry, &instance);
 
         let create_info = WaylandSurfaceCreateInfoKHR {
-            s_type: StructureType::WAYLAND_SURFACE_CREATE_INFO_KHR,
             display: display_handle.display.as_ptr(),
             surface: window_handle.surface.as_ptr(),
             ..Default::default()
@@ -281,7 +285,6 @@ impl HelloTriangleApplication {
             api_version: make_api_version(0, 1, 0, 0),
             p_application_name: cstr!("MyTest").as_ptr(),
 
-            s_type: StructureType::APPLICATION_INFO,
             ..Default::default()
         };
 
@@ -343,7 +346,6 @@ impl HelloTriangleApplication {
                 queue_family_index: index,
                 p_queue_priorities: &1.0f32,
 
-                s_type: StructureType::DEVICE_QUEUE_CREATE_INFO,
                 ..Default::default()
             })
             .collect();
@@ -359,7 +361,6 @@ impl HelloTriangleApplication {
 
             p_enabled_features: &device_features,
 
-            s_type: StructureType::DEVICE_CREATE_INFO,
             ..Default::default()
         };
 
@@ -503,7 +504,6 @@ impl HelloTriangleApplication {
             };
 
         let create_info = SwapchainCreateInfoKHR {
-            s_type: StructureType::SWAPCHAIN_CREATE_INFO_KHR,
             surface,
             min_image_count: image_count,
             image_format: surface_format.format,
@@ -585,7 +585,6 @@ impl HelloTriangleApplication {
             .iter()
             .map(|&img| {
                 let create_info = ImageViewCreateInfo {
-                    s_type: StructureType::IMAGE_VIEW_CREATE_INFO,
                     image: img,
                     view_type: ImageViewType::TYPE_2D,
                     format: swap_chain_data.format,
@@ -614,10 +613,12 @@ impl HelloTriangleApplication {
             .collect()
     }
 
-    fn create_graphics_pipeline(device: &Device) {
+    fn create_graphics_pipeline(
+        device: &Device,
+        swap_chain_data: &SwapChainData,
+    ) -> PipelineLayout {
         let vert_shader_module = Self::create_shader_module(device, include_shader!("vert.spv"));
         let vert_shader_stage_info = PipelineShaderStageCreateInfo {
-            s_type: StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage: ShaderStageFlags::VERTEX,
             module: vert_shader_module,
             p_name: cstr!("main").as_ptr(),
@@ -627,7 +628,6 @@ impl HelloTriangleApplication {
 
         let frag_shader_module = Self::create_shader_module(device, include_shader!("frag.spv"));
         let frag_shader_stage_info = PipelineShaderStageCreateInfo {
-            s_type: StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage: ShaderStageFlags::FRAGMENT,
             module: frag_shader_module,
             p_name: cstr!("main").as_ptr(),
@@ -637,15 +637,93 @@ impl HelloTriangleApplication {
 
         let shader_stages = [vert_shader_stage_info, frag_shader_stage_info];
 
+        let dynamic_states = [DynamicState::VIEWPORT, DynamicState::SCISSOR];
+        let dynamic_state = PipelineDynamicStateCreateInfo {
+            dynamic_state_count: dynamic_states.len() as u32,
+            p_dynamic_states: dynamic_states.as_ptr(),
+
+            ..Default::default()
+        };
+
+        let vertex_input_info = PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = PipelineInputAssemblyStateCreateInfo {
+            topology: PrimitiveTopology::TRIANGLE_LIST,
+            primitive_restart_enable: FALSE,
+
+            ..Default::default()
+        };
+
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: swap_chain_data.extent.width as f32,
+            height: swap_chain_data.extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = Rect2D {
+            offset: Offset2D { x: 0, y: 0 },
+            extent: swap_chain_data.extent,
+        };
+        let viewport_state = PipelineViewportStateCreateInfo {
+            viewport_count: 1,
+            scissor_count: 1,
+            ..Default::default()
+        };
+
+        let rasterizer = PipelineRasterizationStateCreateInfo {
+            depth_clamp_enable: FALSE,
+            rasterizer_discard_enable: FALSE,
+
+            polygon_mode: PolygonMode::FILL,
+            line_width: 1.0,
+
+            cull_mode: CullModeFlags::BACK,
+            front_face: FrontFace::CLOCKWISE,
+
+            depth_bias_enable: FALSE,
+
+            ..Default::default()
+        };
+
+        let multisampling = PipelineMultisampleStateCreateInfo {
+            sample_shading_enable: FALSE,
+            rasterization_samples: SampleCountFlags::TYPE_1,
+
+            ..Default::default()
+        };
+
+        let color_blend_attachments = [PipelineColorBlendAttachmentState {
+            color_write_mask: ColorComponentFlags::RGBA,
+            blend_enable: FALSE,
+
+            ..Default::default()
+        }];
+
+        let color_blending = PipelineColorBlendStateCreateInfo {
+            logic_op_enable: FALSE,
+
+            attachment_count: color_blend_attachments.len() as u32,
+            p_attachments: color_blend_attachments.as_ptr(),
+
+            ..Default::default()
+        };
+
+        let pipeline_layout_info = PipelineLayoutCreateInfo::default();
+
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
+            .expect("failed to create pipeline layout!");
+
         unsafe {
             device.destroy_shader_module(vert_shader_module, None);
             device.destroy_shader_module(frag_shader_module, None);
         }
+
+        pipeline_layout
     }
 
     fn create_shader_module(device: &Device, code: &[u8]) -> ShaderModule {
         let create_info = ShaderModuleCreateInfo {
-            s_type: StructureType::SHADER_MODULE_CREATE_INFO,
             code_size: code.len(),
             p_code: code.as_ptr() as *const u32,
 
@@ -663,6 +741,8 @@ impl Drop for HelloTriangleApplication {
             #[cfg(debug_assertions)]
             ManuallyDrop::drop(&mut self.messenger);
 
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
             self.image_views
                 .iter()
                 .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
