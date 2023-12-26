@@ -200,6 +200,7 @@ struct HelloTriangleApplication {
 
     render_pass: RenderPass,
     pipeline_layout: PipelineLayout,
+    pipeline: Pipeline,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -228,7 +229,8 @@ impl HelloTriangleApplication {
         let image_views = Self::create_image_views(&device, &swap_chain_data);
 
         let render_pass = Self::create_render_pass(&device, &swap_chain_data);
-        let pipeline_layout = Self::create_graphics_pipeline(&device, &swap_chain_data);
+        let (pipeline, pipeline_layout) =
+            Self::create_graphics_pipeline(&device, &swap_chain_data, render_pass);
 
         Self {
             entry,
@@ -240,6 +242,7 @@ impl HelloTriangleApplication {
             image_views,
             render_pass,
             pipeline_layout,
+            pipeline,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -620,7 +623,8 @@ impl HelloTriangleApplication {
     fn create_graphics_pipeline(
         device: &Device,
         swap_chain_data: &SwapChainData,
-    ) -> PipelineLayout {
+        render_pass: RenderPass,
+    ) -> (Pipeline, PipelineLayout) {
         let vert_shader_module = Self::create_shader_module(device, include_shader!("vert.spv"));
         let vert_shader_stage_info = PipelineShaderStageCreateInfo {
             stage: ShaderStageFlags::VERTEX,
@@ -718,12 +722,37 @@ impl HelloTriangleApplication {
         let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
             .expect("failed to create pipeline layout!");
 
+        let pipeline_infos = [GraphicsPipelineCreateInfo {
+            stage_count: shader_stages.len() as u32,
+            p_stages: shader_stages.as_ptr(),
+
+            p_vertex_input_state: &vertex_input_info,
+            p_input_assembly_state: &input_assembly,
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &rasterizer,
+            p_multisample_state: &multisampling,
+            p_color_blend_state: &color_blending,
+            p_dynamic_state: &dynamic_state,
+
+            layout: pipeline_layout,
+
+            render_pass,
+            subpass: 0,
+
+            ..Default::default()
+        }];
+
+        let pipeline = unsafe {
+            device.create_graphics_pipelines(PipelineCache::null(), &pipeline_infos, None)
+        }
+        .expect("failed to create graphics pipeline!")[0];
+
         unsafe {
             device.destroy_shader_module(vert_shader_module, None);
             device.destroy_shader_module(frag_shader_module, None);
         }
 
-        pipeline_layout
+        (pipeline, pipeline_layout)
     }
 
     fn create_shader_module(device: &Device, code: &[u8]) -> ShaderModule {
@@ -786,9 +815,7 @@ impl HelloTriangleApplication {
 impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         unsafe {
-            #[cfg(debug_assertions)]
-            ManuallyDrop::drop(&mut self.messenger);
-
+            self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
@@ -799,6 +826,10 @@ impl Drop for HelloTriangleApplication {
                 .destroy_swapchain(self.swap_chain_data.swap_chain, None);
             self.device.destroy_device(None);
             Surface::new(&self.entry, &self.instance).destroy_surface(self.surface, None);
+
+            #[cfg(debug_assertions)]
+            ManuallyDrop::drop(&mut self.messenger);
+
             self.instance.destroy_instance(None);
         }
     }
