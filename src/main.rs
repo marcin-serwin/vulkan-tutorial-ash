@@ -13,16 +13,27 @@ use winit::raw_window_handle::{
 };
 use winit::window::Window;
 
+macro_rules! include_shader {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name))
+    };
+}
+
 unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
     return CStr::from_ptr(name.as_ptr());
 }
+macro_rules! cstr {
+    ($str:literal) => {
+        unsafe { CStr::from_bytes_with_nul_unchecked(concat!($str, "\0").as_bytes()) }
+    };
+}
+
 const DEVICE_EXTENSIONS: [&CStr; 1] = [KhrSwapchainFn::name()];
 
 #[cfg(not(debug_assertions))]
 const LAYERS: [&CStr; 0] = [];
 #[cfg(debug_assertions)]
-const LAYERS: [&CStr; 1] =
-    [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
+const LAYERS: [&CStr; 1] = [cstr!("VK_LAYER_KHRONOS_validation")];
 fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
     if LAYERS.is_empty() {
         return LAYERS;
@@ -201,15 +212,16 @@ impl HelloTriangleApplication {
             present_queue: unsafe { device.get_device_queue(queue_indices.present_family, 0) },
         };
 
-        let swapchain = Swapchain::new(&instance, &device);
         let swap_chain_data = Self::create_swap_chain(
-            &swapchain,
+            &Swapchain::new(&instance, &device),
             window,
             surface,
             swap_chain_support_details,
             queue_indices,
         );
         let image_views = Self::create_image_views(&device, &swap_chain_data);
+
+        let shaders = Self::create_graphics_pipeline(&device);
 
         Self {
             entry,
@@ -265,11 +277,9 @@ impl HelloTriangleApplication {
     }
 
     fn create_instance(entry: &Entry) -> Instance {
-        const APP_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"MyTest\0") };
-
         let app_info = ApplicationInfo {
             api_version: make_api_version(0, 1, 0, 0),
-            p_application_name: APP_NAME.as_ptr(),
+            p_application_name: cstr!("MyTest").as_ptr(),
 
             s_type: StructureType::APPLICATION_INFO,
             ..Default::default()
@@ -602,6 +612,48 @@ impl HelloTriangleApplication {
                     .expect("failed to create image view")
             })
             .collect()
+    }
+
+    fn create_graphics_pipeline(device: &Device) {
+        let vert_shader_module = Self::create_shader_module(device, include_shader!("vert.spv"));
+        let vert_shader_stage_info = PipelineShaderStageCreateInfo {
+            s_type: StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: ShaderStageFlags::VERTEX,
+            module: vert_shader_module,
+            p_name: cstr!("main").as_ptr(),
+
+            ..Default::default()
+        };
+
+        let frag_shader_module = Self::create_shader_module(device, include_shader!("frag.spv"));
+        let frag_shader_stage_info = PipelineShaderStageCreateInfo {
+            s_type: StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: ShaderStageFlags::FRAGMENT,
+            module: frag_shader_module,
+            p_name: cstr!("main").as_ptr(),
+
+            ..Default::default()
+        };
+
+        let shader_stages = [vert_shader_stage_info, frag_shader_stage_info];
+
+        unsafe {
+            device.destroy_shader_module(vert_shader_module, None);
+            device.destroy_shader_module(frag_shader_module, None);
+        }
+    }
+
+    fn create_shader_module(device: &Device, code: &[u8]) -> ShaderModule {
+        let create_info = ShaderModuleCreateInfo {
+            s_type: StructureType::SHADER_MODULE_CREATE_INFO,
+            code_size: code.len(),
+            p_code: code.as_ptr() as *const u32,
+
+            ..Default::default()
+        };
+
+        unsafe { device.create_shader_module(&create_info, None) }
+            .expect("failed to create shader module")
     }
 }
 
