@@ -205,6 +205,9 @@ struct HelloTriangleApplication {
 
     framebuffers: Vec<Framebuffer>,
 
+    command_pool: CommandPool,
+    command_buffer: CommandBuffer,
+
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
 }
@@ -227,7 +230,7 @@ impl HelloTriangleApplication {
             window,
             surface,
             swap_chain_support_details,
-            queue_indices,
+            &queue_indices,
         );
         let image_views = Self::create_image_views(&device, &swap_chain_data);
 
@@ -237,6 +240,9 @@ impl HelloTriangleApplication {
 
         let framebuffers =
             Self::create_framebuffers(&device, &swap_chain_data, &image_views, render_pass);
+
+        let command_pool = Self::create_command_pool(&device, &queue_indices);
+        let command_buffer = Self::create_command_buffer(&device, command_pool);
 
         Self {
             entry,
@@ -254,6 +260,9 @@ impl HelloTriangleApplication {
             pipeline,
 
             framebuffers,
+
+            command_pool,
+            command_buffer,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -494,7 +503,7 @@ impl HelloTriangleApplication {
         window: &Window,
         surface: SurfaceKHR,
         swap_chain_support: SwapChainSupportDetails,
-        queue_family_indices: QueueFamilyIndices,
+        queue_family_indices: &QueueFamilyIndices,
     ) -> SwapChainData {
         let surface_format = Self::choose_swap_surface_format(&swap_chain_support.formats);
         let present_mode = Self::choose_swap_present_mode(&swap_chain_support.present_modes);
@@ -672,18 +681,6 @@ impl HelloTriangleApplication {
             ..Default::default()
         };
 
-        let viewport = Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: swap_chain_data.extent.width as f32,
-            height: swap_chain_data.extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        let scissor = Rect2D {
-            offset: Offset2D { x: 0, y: 0 },
-            extent: swap_chain_data.extent,
-        };
         let viewport_state = PipelineViewportStateCreateInfo {
             viewport_count: 1,
             scissor_count: 1,
@@ -850,11 +847,112 @@ impl HelloTriangleApplication {
             })
             .collect()
     }
+
+    fn create_command_pool(
+        device: &Device,
+        queue_family_indices: &QueueFamilyIndices,
+    ) -> CommandPool {
+        let pool_info = CommandPoolCreateInfo {
+            flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            queue_family_index: queue_family_indices.graphics_family,
+
+            ..Default::default()
+        };
+
+        unsafe { device.create_command_pool(&pool_info, None) }
+            .expect("failed to create framebuffer!")
+    }
+
+    fn create_command_buffer(device: &Device, command_pool: CommandPool) -> CommandBuffer {
+        let alloc_info = CommandBufferAllocateInfo {
+            command_pool,
+            level: CommandBufferLevel::PRIMARY,
+            command_buffer_count: 1,
+
+            ..Default::default()
+        };
+
+        unsafe { device.allocate_command_buffers(&alloc_info) }
+            .expect("failed to allocate command buffers!")[0]
+    }
+
+    fn record_command_buffer(
+        device: &Device,
+        command_buffer: CommandBuffer,
+        image_index: u32,
+        render_pass: RenderPass,
+        swap_chain_data: &SwapChainData,
+        swap_chain_framebuffers: &Vec<Framebuffer>,
+        graphics_pipeline: Pipeline,
+    ) {
+        let begin_info = CommandBufferBeginInfo::default();
+
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+            .expect("failed to allocate command buffers!");
+
+        let clear_colors = [ClearValue {
+            color: ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+
+        let render_pass_info = RenderPassBeginInfo {
+            render_pass,
+            framebuffer: swap_chain_framebuffers[image_index as usize],
+            render_area: Rect2D {
+                offset: Offset2D { x: 0, y: 0 },
+                extent: swap_chain_data.extent,
+            },
+
+            clear_value_count: clear_colors.len() as u32,
+            p_clear_values: clear_colors.as_ptr(),
+
+            ..Default::default()
+        };
+
+        let viewports = [Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: swap_chain_data.extent.width as f32,
+            height: swap_chain_data.extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+
+        let scissors = [Rect2D {
+            offset: Offset2D { x: 0, y: 0 },
+            extent: swap_chain_data.extent,
+        }];
+
+        unsafe {
+            device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_info,
+                SubpassContents::INLINE,
+            );
+
+            device.cmd_bind_pipeline(
+                command_buffer,
+                PipelineBindPoint::GRAPHICS,
+                graphics_pipeline,
+            );
+
+            device.cmd_set_viewport(command_buffer, 0, &viewports);
+            device.cmd_set_scissor(command_buffer, 0, &scissors);
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+
+            device
+                .end_command_buffer(command_buffer)
+                .expect("failed to record command buffer!");
+        }
+    }
 }
 
 impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
                 .iter()
                 .for_each(|&fbuf| self.device.destroy_framebuffer(fbuf, None));
