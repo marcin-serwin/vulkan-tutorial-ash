@@ -183,7 +183,8 @@ struct QueueFamily {
 }
 
 struct SwapChainData {
-    swap_chain: SwapchainKHR,
+    fns: Swapchain,
+    chain: SwapchainKHR,
     images: Vec<Image>,
     format: Format,
     extent: Extent2D,
@@ -196,7 +197,7 @@ struct HelloTriangleApplication {
     device: Device,
 
     queue_family: QueueFamily,
-    swap_chain_data: SwapChainData,
+    swap_chain: SwapChainData,
     image_views: Vec<ImageView>,
 
     render_pass: RenderPass,
@@ -207,6 +208,10 @@ struct HelloTriangleApplication {
 
     command_pool: CommandPool,
     command_buffer: CommandBuffer,
+
+    image_available: Semaphore,
+    render_finished: Semaphore,
+    in_flight: Fence,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -225,24 +230,25 @@ impl HelloTriangleApplication {
             present_queue: unsafe { device.get_device_queue(queue_indices.present_family, 0) },
         };
 
-        let swap_chain_data = Self::create_swap_chain(
-            &Swapchain::new(&instance, &device),
+        let swap_chain = Self::create_swap_chain(
+            Swapchain::new(&instance, &device),
             window,
             surface,
             swap_chain_support_details,
             &queue_indices,
         );
-        let image_views = Self::create_image_views(&device, &swap_chain_data);
+        let image_views = Self::create_image_views(&device, &swap_chain);
 
-        let render_pass = Self::create_render_pass(&device, &swap_chain_data);
-        let (pipeline, pipeline_layout) =
-            Self::create_graphics_pipeline(&device, &swap_chain_data, render_pass);
+        let render_pass = Self::create_render_pass(&device, &swap_chain);
+        let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
 
         let framebuffers =
-            Self::create_framebuffers(&device, &swap_chain_data, &image_views, render_pass);
+            Self::create_framebuffers(&device, &swap_chain, &image_views, render_pass);
 
         let command_pool = Self::create_command_pool(&device, &queue_indices);
         let command_buffer = Self::create_command_buffer(&device, command_pool);
+
+        let (image_available, render_finished, in_flight) = Self::create_sync_objects(&device);
 
         Self {
             entry,
@@ -251,7 +257,7 @@ impl HelloTriangleApplication {
             device,
 
             queue_family,
-            swap_chain_data,
+            swap_chain,
             image_views,
 
             render_pass,
@@ -264,8 +270,80 @@ impl HelloTriangleApplication {
             command_pool,
             command_buffer,
 
+            image_available,
+            render_finished,
+            in_flight,
+
             #[cfg(debug_assertions)]
             messenger,
+        }
+    }
+
+    fn draw_frame(&self) {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .expect("failed to wait for fence");
+
+            self.device
+                .reset_fences(&[self.in_flight])
+                .expect("failed to reset fence");
+        }
+
+        let image_index = unsafe {
+            self.swap_chain
+                .fns
+                .acquire_next_image(
+                    self.swap_chain.chain,
+                    u64::MAX,
+                    self.image_available,
+                    Fence::null(),
+                )
+                .expect("failed to acquire next image from swap chain")
+                .0
+        };
+
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command_buffer, CommandBufferResetFlags::empty())
+                .expect("failed to reset command buffer");
+
+            self.record_command_buffer(image_index);
+        }
+
+        let wait_semaphores = [self.image_available];
+        let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let cmd_buffers = [self.command_buffer];
+        let signal_semaphores = [self.render_finished];
+
+        let submit_info = SubmitInfo::builder()
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(&cmd_buffers)
+            .signal_semaphores(&signal_semaphores);
+
+        unsafe {
+            self.device
+                .queue_submit(
+                    self.queue_family.graphics_queue,
+                    &[*submit_info],
+                    self.in_flight,
+                )
+                .expect("failed to submit draw command buffer!")
+        };
+
+        let swapchains = [self.swap_chain.chain];
+        let image_indices = [image_index];
+        let present_info = PresentInfoKHR::builder()
+            .wait_semaphores(&signal_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+
+        unsafe {
+            self.swap_chain
+                .fns
+                .queue_present(self.queue_family.present_queue, &present_info)
+                .expect("failed to present queue");
         }
     }
 
@@ -499,7 +577,7 @@ impl HelloTriangleApplication {
     }
 
     fn create_swap_chain(
-        swapchain: &Swapchain,
+        swapchain: Swapchain,
         window: &Window,
         surface: SurfaceKHR,
         swap_chain_support: SwapChainSupportDetails,
@@ -563,7 +641,8 @@ impl HelloTriangleApplication {
             .expect("failed to get swapchain images");
 
         SwapChainData {
-            swap_chain,
+            fns: swapchain,
+            chain: swap_chain,
             format: surface_format.format,
             extent,
             images,
@@ -642,7 +721,6 @@ impl HelloTriangleApplication {
 
     fn create_graphics_pipeline(
         device: &Device,
-        swap_chain_data: &SwapChainData,
         render_pass: RenderPass,
     ) -> (Pipeline, PipelineLayout) {
         let vert_shader_module = Self::create_shader_module(device, include_shader!("vert.spv"));
@@ -805,17 +883,25 @@ impl HelloTriangleApplication {
             ..Default::default()
         }];
 
-        let render_pass_create_info = RenderPassCreateInfo {
-            attachment_count: color_attachments.len() as u32,
-            p_attachments: color_attachments.as_ptr(),
+        let dependencies = [SubpassDependency {
+            src_subpass: SUBPASS_EXTERNAL,
+            dst_subpass: 0,
 
-            subpass_count: subpasses.len() as u32,
-            p_subpasses: subpasses.as_ptr(),
+            src_stage_mask: PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            src_access_mask: AccessFlags::empty(),
+
+            dst_stage_mask: PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_access_mask: AccessFlags::COLOR_ATTACHMENT_WRITE,
 
             ..Default::default()
-        };
+        }];
 
-        unsafe { device.create_render_pass(&render_pass_create_info, None) }
+        let render_pass_info = RenderPassCreateInfo::builder()
+            .attachments(&color_attachments)
+            .subpasses(&subpasses)
+            .dependencies(&dependencies);
+
+        unsafe { device.create_render_pass(&render_pass_info, None) }
             .expect("failed to create render pass!")
     }
 
@@ -827,14 +913,14 @@ impl HelloTriangleApplication {
     ) -> Vec<Framebuffer> {
         image_views
             .iter()
-            .enumerate()
-            .map(|(index, &img_view)| {
+            .map(|&img_view| {
                 let attachments = [img_view];
 
                 let framebuffer_info = FramebufferCreateInfo {
                     render_pass,
                     attachment_count: attachments.len() as u32,
                     p_attachments: attachments.as_ptr(),
+
                     width: swap_chain_data.extent.width,
                     height: swap_chain_data.extent.height,
                     layers: 1,
@@ -876,19 +962,14 @@ impl HelloTriangleApplication {
             .expect("failed to allocate command buffers!")[0]
     }
 
-    fn record_command_buffer(
-        device: &Device,
-        command_buffer: CommandBuffer,
-        image_index: u32,
-        render_pass: RenderPass,
-        swap_chain_data: &SwapChainData,
-        swap_chain_framebuffers: &Vec<Framebuffer>,
-        graphics_pipeline: Pipeline,
-    ) {
+    fn record_command_buffer(&self, image_index: u32) {
         let begin_info = CommandBufferBeginInfo::default();
 
-        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
-            .expect("failed to allocate command buffers!");
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+        }
+        .expect("failed to allocate command buffers!");
 
         let clear_colors = [ClearValue {
             color: ClearColorValue {
@@ -897,11 +978,11 @@ impl HelloTriangleApplication {
         }];
 
         let render_pass_info = RenderPassBeginInfo {
-            render_pass,
-            framebuffer: swap_chain_framebuffers[image_index as usize],
+            render_pass: self.render_pass,
+            framebuffer: self.framebuffers[image_index as usize],
             render_area: Rect2D {
                 offset: Offset2D { x: 0, y: 0 },
-                extent: swap_chain_data.extent,
+                extent: self.swap_chain.extent,
             },
 
             clear_value_count: clear_colors.len() as u32,
@@ -913,38 +994,62 @@ impl HelloTriangleApplication {
         let viewports = [Viewport {
             x: 0.0,
             y: 0.0,
-            width: swap_chain_data.extent.width as f32,
-            height: swap_chain_data.extent.height as f32,
+            width: self.swap_chain.extent.width as f32,
+            height: self.swap_chain.extent.height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
 
         let scissors = [Rect2D {
             offset: Offset2D { x: 0, y: 0 },
-            extent: swap_chain_data.extent,
+            extent: self.swap_chain.extent,
         }];
 
         unsafe {
-            device.cmd_begin_render_pass(
-                command_buffer,
+            self.device.cmd_begin_render_pass(
+                self.command_buffer,
                 &render_pass_info,
                 SubpassContents::INLINE,
             );
 
-            device.cmd_bind_pipeline(
-                command_buffer,
+            self.device.cmd_bind_pipeline(
+                self.command_buffer,
                 PipelineBindPoint::GRAPHICS,
-                graphics_pipeline,
+                self.pipeline,
             );
 
-            device.cmd_set_viewport(command_buffer, 0, &viewports);
-            device.cmd_set_scissor(command_buffer, 0, &scissors);
-            device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            device.cmd_end_render_pass(command_buffer);
+            self.device
+                .cmd_set_viewport(self.command_buffer, 0, &viewports);
+            self.device
+                .cmd_set_scissor(self.command_buffer, 0, &scissors);
+            self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(self.command_buffer);
 
-            device
-                .end_command_buffer(command_buffer)
+            self.device
+                .end_command_buffer(self.command_buffer)
                 .expect("failed to record command buffer!");
+        }
+    }
+
+    fn create_sync_objects(device: &Device) -> (Semaphore, Semaphore, Fence) {
+        let semaphore_info = SemaphoreCreateInfo::default();
+        let fence_info = FenceCreateInfo {
+            flags: FenceCreateFlags::SIGNALED,
+
+            ..Default::default()
+        };
+        unsafe {
+            (
+                device
+                    .create_semaphore(&semaphore_info, None)
+                    .expect("failed to create semaphore"),
+                device
+                    .create_semaphore(&semaphore_info, None)
+                    .expect("failed to create semaphore"),
+                device
+                    .create_fence(&fence_info, None)
+                    .expect("failed to create fence"),
+            )
         }
     }
 }
@@ -952,6 +1057,14 @@ impl HelloTriangleApplication {
 impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         unsafe {
+            self.device
+                .device_wait_idle()
+                .expect("failed while waiting for device idle");
+
+            self.device.destroy_semaphore(self.image_available, None);
+            self.device.destroy_semaphore(self.render_finished, None);
+            self.device.destroy_fence(self.in_flight, None);
+
             self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
                 .iter()
@@ -966,8 +1079,9 @@ impl Drop for HelloTriangleApplication {
                 .iter()
                 .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
 
-            Swapchain::new(&self.instance, &self.device)
-                .destroy_swapchain(self.swap_chain_data.swap_chain, None);
+            self.swap_chain
+                .fns
+                .destroy_swapchain(self.swap_chain.chain, None);
             self.device.destroy_device(None);
             Surface::new(&self.entry, &self.instance).destroy_surface(self.surface, None);
 
@@ -985,9 +1099,7 @@ fn main() {
 
     let entry = Entry::linked();
 
-    let _app = HelloTriangleApplication::new(entry, &window);
-
-    return;
+    let app = HelloTriangleApplication::new(entry, &window);
 
     let mat = glm::mat2(1., 2., 3., 4.);
     let v = glm::vec2(1., 2.);
@@ -1005,9 +1117,14 @@ fn main() {
                 println!("Close clicked");
                 elwt.exit();
             }
-            Event::AboutToWait => elwt.exit(),
+            Event::WindowEvent {
+                window_id: _,
+                event: WindowEvent::RedrawRequested,
+            } => {
+                app.draw_frame();
+            }
             _ => {
-                println!("{event:?}")
+                // println!("{event:?}");
             }
         })
         .unwrap();
