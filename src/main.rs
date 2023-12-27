@@ -185,7 +185,6 @@ struct QueueFamily {
 }
 
 struct SwapChainData {
-    fns: Swapchain,
     chain: SwapchainKHR,
     images: Vec<Image>,
     format: Format,
@@ -198,11 +197,20 @@ struct SyncObjects {
     in_flight_fences: [Fence; MAX_FRAMES_IN_FLIGHT],
 }
 
-struct HelloTriangleApplication {
+struct DeviceInfo {
+    device: Device,
+    swap_chain_support: SwapChainSupportDetails,
+    queue_indices: QueueFamilyIndices,
+}
+
+struct HelloTriangleApplication<'a> {
     entry: Entry,
     instance: Instance,
+    window: &'a Window,
     surface: SurfaceKHR,
-    device: Device,
+    device_info: DeviceInfo,
+    swapchain_fns: Swapchain,
+    occluded: bool,
 
     queue_family: QueueFamily,
     swap_chain: SwapChainData,
@@ -224,35 +232,46 @@ struct HelloTriangleApplication {
     messenger: ManuallyDrop<Messenger>,
 }
 
-impl HelloTriangleApplication {
-    fn new(entry: Entry, window: &Window) -> Self {
+impl<'a> HelloTriangleApplication<'a> {
+    fn new(entry: Entry, window: &'a Window) -> Self {
+        let occluded = {
+            let winit::dpi::PhysicalSize { width, height } = window.inner_size();
+
+            width == 0 || height == 0
+        };
         let instance = Self::create_instance(&entry);
         #[cfg(debug_assertions)]
         let messenger = ManuallyDrop::new(unsafe { Messenger::new(&entry, &instance) });
         let surface = Self::create_surface(&entry, &instance, window);
-        let (device, queue_indices, swap_chain_support_details) =
-            Self::create_logical_device(&entry, &instance, surface);
+        let device_info = Self::create_logical_device(&entry, &instance, surface);
+        let device = &device_info.device;
+
         let queue_family = QueueFamily {
-            graphics_queue: unsafe { device.get_device_queue(queue_indices.graphics_family, 0) },
-            present_queue: unsafe { device.get_device_queue(queue_indices.present_family, 0) },
+            graphics_queue: unsafe {
+                device.get_device_queue(device_info.queue_indices.graphics_family, 0)
+            },
+            present_queue: unsafe {
+                device.get_device_queue(device_info.queue_indices.present_family, 0)
+            },
         };
 
+        let swapchain_fns = Swapchain::new(&instance, &device);
         let swap_chain = Self::create_swap_chain(
-            Swapchain::new(&instance, &device),
+            &swapchain_fns,
             window,
             surface,
-            swap_chain_support_details,
-            &queue_indices,
+            &device_info.swap_chain_support,
+            &device_info.queue_indices,
         );
         let image_views = Self::create_image_views(&device, &swap_chain);
 
         let render_pass = Self::create_render_pass(&device, &swap_chain);
-        let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
-
         let framebuffers =
             Self::create_framebuffers(&device, &swap_chain, &image_views, render_pass);
 
-        let command_pool = Self::create_command_pool(&device, &queue_indices);
+        let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
+
+        let command_pool = Self::create_command_pool(&device, &device_info.queue_indices);
         let command_buffers = Self::create_command_buffers(&device, command_pool);
 
         let sync_objects = Self::create_sync_objects(&device);
@@ -260,8 +279,11 @@ impl HelloTriangleApplication {
         Self {
             entry,
             instance,
+            window,
             surface,
-            device,
+            device_info,
+            swapchain_fns,
+            occluded,
 
             queue_family,
             swap_chain,
@@ -286,36 +308,47 @@ impl HelloTriangleApplication {
     }
 
     fn draw_frame(&mut self) {
+        if self.occluded {
+            return;
+        }
         let in_flight = self.sync_objects.in_flight_fences[self.current_frame];
         let img_available = self.sync_objects.image_available_semaphores[self.current_frame];
         let render_finished = self.sync_objects.render_finished_semaphores[self.current_frame];
         let command_buffer = self.command_buffers[self.current_frame];
 
         unsafe {
-            self.device
+            self.device_info
+                .device
                 .wait_for_fences(&[in_flight], true, u64::MAX)
                 .expect("failed to wait for fence");
+        }
 
-            self.device
+        let image_index = unsafe {
+            match self.swapchain_fns.acquire_next_image(
+                self.swap_chain.chain,
+                u64::MAX,
+                img_available,
+                Fence::null(),
+            ) {
+                Ok((index, _)) => index,
+                Err(Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swap_chain();
+                    return;
+                }
+                _ => panic!("failed to acquire next image from swap chain"),
+            }
+        };
+
+        unsafe {
+            self.device_info
+                .device
                 .reset_fences(&[in_flight])
                 .expect("failed to reset fence");
         }
 
-        let image_index = unsafe {
-            self.swap_chain
-                .fns
-                .acquire_next_image(
-                    self.swap_chain.chain,
-                    u64::MAX,
-                    img_available,
-                    Fence::null(),
-                )
-                .expect("failed to acquire next image from swap chain")
-                .0
-        };
-
         unsafe {
-            self.device
+            self.device_info
+                .device
                 .reset_command_buffer(command_buffer, CommandBufferResetFlags::empty())
                 .expect("failed to reset command buffer");
 
@@ -334,7 +367,8 @@ impl HelloTriangleApplication {
             .signal_semaphores(&signal_semaphores);
 
         unsafe {
-            self.device
+            self.device_info
+                .device
                 .queue_submit(self.queue_family.graphics_queue, &[*submit_info], in_flight)
                 .expect("failed to submit draw command buffer!")
         };
@@ -347,10 +381,14 @@ impl HelloTriangleApplication {
             .image_indices(&image_indices);
 
         unsafe {
-            self.swap_chain
-                .fns
+            match self
+                .swapchain_fns
                 .queue_present(self.queue_family.present_queue, &present_info)
-                .expect("failed to present queue");
+            {
+                Ok(false) => (),
+                Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swap_chain(),
+                _ => panic!("failed to present queue"),
+            }
         }
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
@@ -441,7 +479,7 @@ impl HelloTriangleApplication {
         entry: &Entry,
         instance: &Instance,
         surface: SurfaceKHR,
-    ) -> (Device, QueueFamilyIndices, SwapChainSupportDetails) {
+    ) -> DeviceInfo {
         let (physical_device, queue_indices, swap_chain_support_details) =
             Self::pick_physical_device(entry, instance, surface);
 
@@ -479,7 +517,12 @@ impl HelloTriangleApplication {
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .expect("failed to create logical device!");
-        (device, queue_indices, swap_chain_support_details)
+
+        DeviceInfo {
+            device,
+            queue_indices,
+            swap_chain_support: swap_chain_support_details,
+        }
     }
 
     fn find_queue_families(
@@ -585,10 +628,10 @@ impl HelloTriangleApplication {
     }
 
     fn create_swap_chain(
-        swapchain: Swapchain,
+        swapchain: &Swapchain,
         window: &Window,
         surface: SurfaceKHR,
-        swap_chain_support: SwapChainSupportDetails,
+        swap_chain_support: &SwapChainSupportDetails,
         queue_family_indices: &QueueFamilyIndices,
     ) -> SwapChainData {
         let surface_format = Self::choose_swap_surface_format(&swap_chain_support.formats);
@@ -649,7 +692,6 @@ impl HelloTriangleApplication {
             .expect("failed to get swapchain images");
 
         SwapChainData {
-            fns: swapchain,
             chain: swap_chain,
             format: surface_format.format,
             extent,
@@ -978,7 +1020,8 @@ impl HelloTriangleApplication {
         let begin_info = CommandBufferBeginInfo::default();
 
         unsafe {
-            self.device
+            self.device_info
+                .device
                 .begin_command_buffer(command_buffer, &begin_info)
         }
         .expect("failed to allocate command buffers!");
@@ -1018,24 +1061,29 @@ impl HelloTriangleApplication {
         }];
 
         unsafe {
-            self.device.cmd_begin_render_pass(
+            self.device_info.device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_info,
                 SubpassContents::INLINE,
             );
 
-            self.device.cmd_bind_pipeline(
+            self.device_info.device.cmd_bind_pipeline(
                 command_buffer,
                 PipelineBindPoint::GRAPHICS,
                 self.pipeline,
             );
 
-            self.device.cmd_set_viewport(command_buffer, 0, &viewports);
-            self.device.cmd_set_scissor(command_buffer, 0, &scissors);
-            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            self.device.cmd_end_render_pass(command_buffer);
+            self.device_info
+                .device
+                .cmd_set_viewport(command_buffer, 0, &viewports);
+            self.device_info
+                .device
+                .cmd_set_scissor(command_buffer, 0, &scissors);
+            self.device_info.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.device_info.device.cmd_end_render_pass(command_buffer);
 
-            self.device
+            self.device_info
+                .device
                 .end_command_buffer(command_buffer)
                 .expect("failed to record command buffer!");
         }
@@ -1067,12 +1115,60 @@ impl HelloTriangleApplication {
             in_flight_fences: UNIT_ARRAY.map(fence_init),
         }
     }
+
+    unsafe fn cleanup_swap_chain(&mut self) {
+        self.framebuffers
+            .iter()
+            .for_each(|&fbuf| self.device_info.device.destroy_framebuffer(fbuf, None));
+
+        self.device_info
+            .device
+            .destroy_render_pass(self.render_pass, None);
+
+        self.image_views
+            .iter()
+            .for_each(|&img_view| self.device_info.device.destroy_image_view(img_view, None));
+
+        self.swapchain_fns
+            .destroy_swapchain(self.swap_chain.chain, None);
+    }
+
+    fn recreate_swap_chain(&mut self) {
+        if self.occluded {
+            return;
+        }
+        unsafe {
+            self.device_info
+                .device
+                .device_wait_idle()
+                .expect("failed while waiting for device idle")
+        };
+
+        unsafe { self.cleanup_swap_chain() };
+
+        self.swap_chain = Self::create_swap_chain(
+            &self.swapchain_fns,
+            self.window,
+            self.surface,
+            &self.device_info.swap_chain_support,
+            &self.device_info.queue_indices,
+        );
+        self.image_views = Self::create_image_views(&self.device_info.device, &self.swap_chain);
+        self.render_pass = Self::create_render_pass(&self.device_info.device, &self.swap_chain);
+        self.framebuffers = Self::create_framebuffers(
+            &self.device_info.device,
+            &self.swap_chain,
+            &self.image_views,
+            self.render_pass,
+        );
+    }
 }
 
-impl Drop for HelloTriangleApplication {
+impl<'a> Drop for HelloTriangleApplication<'a> {
     fn drop(&mut self) {
         unsafe {
-            self.device
+            self.device_info
+                .device
                 .device_wait_idle()
                 .expect("failed while waiting for device idle");
 
@@ -1080,31 +1176,27 @@ impl Drop for HelloTriangleApplication {
                 .image_available_semaphores
                 .iter()
                 .chain(self.sync_objects.render_finished_semaphores.iter())
-                .for_each(|&sem| self.device.destroy_semaphore(sem, None));
+                .for_each(|&sem| self.device_info.device.destroy_semaphore(sem, None));
 
             self.sync_objects
                 .in_flight_fences
                 .iter()
-                .for_each(|&fence| self.device.destroy_fence(fence, None));
+                .for_each(|&fence| self.device_info.device.destroy_fence(fence, None));
 
-            self.device.destroy_command_pool(self.command_pool, None);
-            self.framebuffers
-                .iter()
-                .for_each(|&fbuf| self.device.destroy_framebuffer(fbuf, None));
+            self.cleanup_swap_chain();
 
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
+            self.device_info
+                .device
+                .destroy_command_pool(self.command_pool, None);
+
+            self.device_info
+                .device
+                .destroy_pipeline(self.pipeline, None);
+            self.device_info
+                .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_render_pass(self.render_pass, None);
 
-            self.image_views
-                .iter()
-                .for_each(|&img_view| self.device.destroy_image_view(img_view, None));
-
-            self.swap_chain
-                .fns
-                .destroy_swapchain(self.swap_chain.chain, None);
-            self.device.destroy_device(None);
+            self.device_info.device.destroy_device(None);
             Surface::new(&self.entry, &self.instance).destroy_surface(self.surface, None);
 
             #[cfg(debug_assertions)]
@@ -1141,8 +1233,24 @@ fn main() {
             }
             Event::WindowEvent {
                 window_id: _,
+                event: WindowEvent::Resized(size),
+            } => {
+                println!("Resized {size:?}");
+                app.occluded = size.width == 0 || size.height == 0;
+                app.recreate_swap_chain();
+            }
+            Event::WindowEvent {
+                window_id: _,
+                event: WindowEvent::Occluded(is_occluded),
+            } => {
+                println!("Occluded: {is_occluded:?}");
+                app.occluded = is_occluded;
+            }
+            Event::WindowEvent {
+                window_id: _,
                 event: WindowEvent::RedrawRequested,
             } => {
+                println!("Redraw requested");
                 app.draw_frame();
             }
             _ => {
