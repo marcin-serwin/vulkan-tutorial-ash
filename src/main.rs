@@ -7,6 +7,8 @@ use ash::extensions::ext::DebugUtils;
 use ash::{extensions::khr::*, vk::*, Device, Entry, Instance};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
+#[cfg(target_os = "macos")]
+use winit::raw_window_handle::AppKitWindowHandle;
 use winit::raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle,
     WaylandWindowHandle,
@@ -33,7 +35,10 @@ fn name_to_cstr(name: &[c_char]) -> &CStr {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+#[cfg(not(target_os = "macos"))]
 const DEVICE_EXTENSIONS: [&CStr; 1] = [KhrSwapchainFn::name()];
+#[cfg(target_os = "macos")]
+const DEVICE_EXTENSIONS: [&CStr; 2] = [KhrSwapchainFn::name(), KhrPortabilitySubsetFn::name()];
 
 #[cfg(not(debug_assertions))]
 const LAYERS: [&CStr; 0] = [];
@@ -60,7 +65,12 @@ fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
 #[cfg(all(target_os = "linux", not(debug_assertions)))]
 const EXTENSIONS: [&CStr; 2] = [KhrSurfaceFn::name(), KhrWaylandSurfaceFn::name()];
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-const EXTENSIONS: [&CStr; 1] = [KhrPortabilityEnumerationFn::name()];
+const EXTENSIONS: [&CStr; 4] = [
+    KhrPortabilityEnumerationFn::name(),
+    KhrSurfaceFn::name(),
+    ExtMetalSurfaceFn::name(),
+    KhrGetPhysicalDeviceProperties2Fn::name(),
+];
 #[cfg(all(target_os = "linux", debug_assertions))]
 const EXTENSIONS: [&CStr; 3] = [
     KhrSurfaceFn::name(),
@@ -68,7 +78,13 @@ const EXTENSIONS: [&CStr; 3] = [
     ExtDebugUtilsFn::name(),
 ];
 #[cfg(all(target_os = "macos", debug_assertions))]
-const EXTENSIONS: [&CStr; 2] = [KhrPortabilityEnumerationFn::name(), ExtDebugUtilsFn::name()];
+const EXTENSIONS: [&CStr; 5] = [
+    KhrPortabilityEnumerationFn::name(),
+    KhrSurfaceFn::name(),
+    ExtMetalSurfaceFn::name(),
+    KhrGetPhysicalDeviceProperties2Fn::name(),
+    ExtDebugUtilsFn::name(),
+];
 
 fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
     if EXTENSIONS.is_empty() {
@@ -405,18 +421,42 @@ impl<'a> HelloTriangleApplication<'a> {
 
         match (window_handle, display_handle) {
             (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) => {
-                Self::create_wayland_surface(&entry, &instance, &window, &display)
+                Self::create_wayland_surface(&entry, &instance, window, display)
+            }
+            #[cfg(target_os = "macos")]
+            (RawWindowHandle::AppKit(window), RawDisplayHandle::AppKit(_)) => {
+                Self::create_app_kit_surface(&entry, &instance, window)
             }
 
             _ => panic!("unsupported windowing system"),
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn create_app_kit_surface(
+        entry: &Entry,
+        instance: &Instance,
+        window_handle: AppKitWindowHandle,
+    ) -> SurfaceKHR {
+        use ash::extensions::ext::MetalSurface;
+        use raw_window_metal::{appkit::metal_layer_from_handle, Layer::*};
+        let surface = MetalSurface::new(&entry, &instance);
+
+        let layer = match unsafe { metal_layer_from_handle(window_handle) } {
+            Existing(layer) | Allocated(layer) => layer,
+        };
+
+        let create_info = MetalSurfaceCreateInfoEXT::builder().layer(layer.cast());
+
+        unsafe { surface.create_metal_surface(&create_info, None) }
+            .expect("failed to create wayland surface")
+    }
+
     fn create_wayland_surface(
         entry: &Entry,
         instance: &Instance,
-        window_handle: &WaylandWindowHandle,
-        display_handle: &WaylandDisplayHandle,
+        window_handle: WaylandWindowHandle,
+        display_handle: WaylandDisplayHandle,
     ) -> SurfaceKHR {
         let surface = WaylandSurface::new(&entry, &instance);
 
@@ -426,9 +466,8 @@ impl<'a> HelloTriangleApplication<'a> {
             ..Default::default()
         };
 
-        let surface = unsafe { surface.create_wayland_surface(&create_info, None) }
-            .expect("failed to create wayland surface");
-        surface
+        unsafe { surface.create_wayland_surface(&create_info, None) }
+            .expect("failed to create wayland surface")
     }
 
     fn create_instance(entry: &Entry) -> Instance {
