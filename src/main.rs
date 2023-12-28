@@ -223,6 +223,7 @@ struct SyncObjects {
 
 struct DeviceInfo {
     device: Device,
+    physical_device: PhysicalDevice,
     swap_chain_support: SwapChainSupportDetails,
     queue_indices: QueueFamilyIndices,
 }
@@ -245,6 +246,9 @@ struct HelloTriangleApplication<'a> {
     pipeline: Pipeline,
 
     framebuffers: Vec<Framebuffer>,
+    vertices: [Vertex; 3],
+
+    vertex_buffer: (Buffer, DeviceMemory),
 
     command_pool: CommandPool,
     command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
@@ -258,6 +262,20 @@ struct HelloTriangleApplication<'a> {
 
 impl<'a> HelloTriangleApplication<'a> {
     fn new(entry: &'a Entry, window: &'a Window) -> Self {
+        let vertices: [Vertex; 3] = [
+            Vertex {
+                pos: glm::vec2(0.0, -0.5),
+                color: glm::vec3(1.0, 0.0, 0.0),
+            },
+            Vertex {
+                pos: glm::vec2(0.5, 0.5),
+                color: glm::vec3(0.0, 1.0, 0.0),
+            },
+            Vertex {
+                pos: glm::vec2(-0.5, 0.5),
+                color: glm::vec3(0.0, 0.0, 1.0),
+            },
+        ];
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
@@ -278,6 +296,8 @@ impl<'a> HelloTriangleApplication<'a> {
                 device.get_device_queue(device_info.queue_indices.present_family, 0)
             },
         };
+
+        let vertex_buffer = Self::create_vertex_buffer(&instance, &device_info, &vertices);
 
         let swapchain_fns = Swapchain::new(&instance, &device);
         let swap_chain = Self::create_swap_chain(
@@ -308,6 +328,9 @@ impl<'a> HelloTriangleApplication<'a> {
             device_info,
             swapchain_fns,
             occluded,
+
+            vertices,
+            vertex_buffer,
 
             queue_family,
             swap_chain,
@@ -558,6 +581,7 @@ impl<'a> HelloTriangleApplication<'a> {
 
         DeviceInfo {
             device,
+            physical_device,
             queue_indices,
             swap_chain_support: swap_chain_support_details,
         }
@@ -1060,14 +1084,11 @@ impl<'a> HelloTriangleApplication<'a> {
     }
 
     fn record_command_buffer(&self, command_buffer: CommandBuffer, image_index: u32) {
+        let device = &self.device_info.device;
         let begin_info = CommandBufferBeginInfo::default();
 
-        unsafe {
-            self.device_info
-                .device
-                .begin_command_buffer(command_buffer, &begin_info)
-        }
-        .expect("failed to allocate command buffers!");
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+            .expect("failed to allocate command buffers!");
 
         let clear_colors = [ClearValue {
             color: ClearColorValue {
@@ -1104,29 +1125,24 @@ impl<'a> HelloTriangleApplication<'a> {
         }];
 
         unsafe {
-            self.device_info.device.cmd_begin_render_pass(
+            device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_info,
                 SubpassContents::INLINE,
             );
 
-            self.device_info.device.cmd_bind_pipeline(
-                command_buffer,
-                PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
+            device.cmd_bind_pipeline(command_buffer, PipelineBindPoint::GRAPHICS, self.pipeline);
 
-            self.device_info
-                .device
-                .cmd_set_viewport(command_buffer, 0, &viewports);
-            self.device_info
-                .device
-                .cmd_set_scissor(command_buffer, 0, &scissors);
-            self.device_info.device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            self.device_info.device.cmd_end_render_pass(command_buffer);
+            device.cmd_set_viewport(command_buffer, 0, &viewports);
+            device.cmd_set_scissor(command_buffer, 0, &scissors);
 
-            self.device_info
-                .device
+            let buffers = [self.vertex_buffer.0];
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &buffers, &[0]);
+
+            device.cmd_draw(command_buffer, self.vertices.len() as u32, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+
+            device
                 .end_command_buffer(command_buffer)
                 .expect("failed to record command buffer!");
         }
@@ -1225,6 +1241,13 @@ impl<'a> HelloTriangleApplication<'a> {
 
             self.device_info
                 .device
+                .free_memory(self.vertex_buffer.1, None);
+            self.device_info
+                .device
+                .destroy_buffer(self.vertex_buffer.0, None);
+
+            self.device_info
+                .device
                 .destroy_command_pool(self.command_pool, None);
 
             self.device_info
@@ -1253,6 +1276,63 @@ impl<'a> HelloTriangleApplication<'a> {
             }
             Err(err) => Err((self, err)),
         }
+    }
+
+    fn create_vertex_buffer(
+        instance: &Instance,
+        device: &DeviceInfo,
+        vertices: &[Vertex; 3],
+    ) -> (Buffer, DeviceMemory) {
+        let buffer_info = BufferCreateInfo::builder()
+            .size(std::mem::size_of_val(vertices) as u64)
+            .usage(BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { device.device.create_buffer(&buffer_info, None) }
+            .expect("failed to create buffer");
+
+        let mem_requirements = unsafe { device.device.get_buffer_memory_requirements(buffer) };
+        let find_memory_buffer = |type_filter: u32, props: MemoryPropertyFlags| -> u32 {
+            let mem_props =
+                unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
+            mem_props
+                .memory_types
+                .iter()
+                .take(mem_props.memory_type_count as usize)
+                .enumerate()
+                .filter(|(index, typ)| {
+                    (type_filter & (1 << index)) != 0 && typ.property_flags.contains(props)
+                })
+                .next()
+                .expect("failed to find suitable memory type")
+                .0 as u32
+        };
+
+        let alloc_info = MemoryAllocateInfo::builder()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(find_memory_buffer(
+                mem_requirements.memory_type_bits,
+                MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+            ));
+
+        let memory = unsafe { device.device.allocate_memory(&alloc_info, None) }
+            .expect("failed to allocate vertex buffer memory");
+
+        unsafe { device.device.bind_buffer_memory(buffer, memory, 0) }
+            .expect("failed to bind buffer memory");
+
+        let data = unsafe {
+            device
+                .device
+                .map_memory(memory, 0, buffer_info.size, MemoryMapFlags::empty())
+        }
+        .expect("failed to map memory");
+
+        unsafe { std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len()) };
+
+        unsafe { device.device.unmap_memory(memory) };
+
+        (buffer, memory)
     }
 }
 
@@ -1304,26 +1384,9 @@ impl Vertex {
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     let window = Window::new(&event_loop).unwrap();
-    let vertices: [Vertex; 3] = [
-        Vertex {
-            pos: glm::vec2(0.0, -0.5),
-            color: glm::vec3(1.0, 0.0, 0.0),
-        },
-        Vertex {
-            pos: glm::vec2(0.5, 0.5),
-            color: glm::vec3(0.0, 1.0, 0.0),
-        },
-        Vertex {
-            pos: glm::vec2(-0.5, 0.5),
-            color: glm::vec3(0.0, 0.0, 1.0),
-        },
-    ];
-
     let entry = Entry::linked();
 
     let mut app = HelloTriangleApplication::new(&entry, &window);
-
-    println!("{vertices:#?}");
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
