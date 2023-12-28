@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 #[cfg(debug_assertions)]
 use std::mem::ManuallyDrop;
+extern crate nalgebra_glm as glm;
 
 use ash::extensions::ext::DebugUtils;
 use ash::{extensions::khr::*, vk::*, Device, Entry, Instance};
@@ -26,6 +27,13 @@ macro_rules! cstr {
         const RESULT: &CStr =
             unsafe { CStr::from_bytes_with_nul_unchecked(concat!($str, "\0").as_bytes()) };
         RESULT
+    }};
+}
+
+macro_rules! offset_of {
+    ($struct:ident, $field:ident) => {{
+        const STRUCT: *const $struct = 0 as *const $struct;
+        (unsafe { std::ptr::addr_of!(((*STRUCT).$field)) } as usize)
     }};
 }
 
@@ -831,7 +839,12 @@ impl<'a> HelloTriangleApplication<'a> {
             ..Default::default()
         };
 
-        let vertex_input_info = PipelineVertexInputStateCreateInfo::default();
+        let binding_descriptions = Vertex::get_binding_descriptions();
+        let attribute_descriptions = Vertex::get_attribute_descriptions();
+        let vertex_input_info = PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(&binding_descriptions)
+            .vertex_attribute_descriptions(&attribute_descriptions);
+
         let input_assembly = PipelineInputAssemblyStateCreateInfo {
             topology: PrimitiveTopology::TRIANGLE_LIST,
             primitive_restart_enable: FALSE,
@@ -892,7 +905,7 @@ impl<'a> HelloTriangleApplication<'a> {
             stage_count: shader_stages.len() as u32,
             p_stages: shader_stages.as_ptr(),
 
-            p_vertex_input_state: &vertex_input_info,
+            p_vertex_input_state: &*vertex_input_info,
             p_input_assembly_state: &input_assembly,
             p_viewport_state: &viewport_state,
             p_rasterization_state: &rasterizer,
@@ -1255,18 +1268,62 @@ impl<'a> Drop for HelloTriangleApplication<'a> {
     }
 }
 
+#[derive(Debug)]
+struct Vertex {
+    pos: glm::Vec2,
+    color: glm::Vec3,
+}
+
+impl Vertex {
+    fn get_binding_descriptions() -> [VertexInputBindingDescription; 1] {
+        [VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<Vertex>() as u32,
+            input_rate: VertexInputRate::VERTEX,
+        }]
+    }
+
+    fn get_attribute_descriptions() -> [VertexInputAttributeDescription; 2] {
+        [
+            VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: Format::R32G32_SFLOAT,
+                offset: offset_of!(Vertex, pos) as u32,
+            },
+            VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Vertex, color) as u32,
+            },
+        ]
+    }
+}
+
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     let window = Window::new(&event_loop).unwrap();
+    let vertices: [Vertex; 3] = [
+        Vertex {
+            pos: glm::vec2(0.0, -0.5),
+            color: glm::vec3(1.0, 0.0, 0.0),
+        },
+        Vertex {
+            pos: glm::vec2(0.5, 0.5),
+            color: glm::vec3(0.0, 1.0, 0.0),
+        },
+        Vertex {
+            pos: glm::vec2(-0.5, 0.5),
+            color: glm::vec3(0.0, 0.0, 1.0),
+        },
+    ];
 
     let entry = Entry::linked();
 
     let mut app = HelloTriangleApplication::new(&entry, &window);
 
-    let mat = glm::mat2(1., 2., 3., 4.);
-    let v = glm::vec2(1., 2.);
-    let test = mat * v;
-    println!("{test:?}");
+    println!("{vertices:#?}");
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
