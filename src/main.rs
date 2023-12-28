@@ -27,8 +27,8 @@ macro_rules! cstr {
     }};
 }
 
-unsafe fn name_to_cstr(name: &[c_char]) -> &CStr {
-    CStr::from_bytes_until_nul(std::mem::transmute(name)).unwrap_unchecked()
+fn name_to_cstr(name: &[c_char]) -> &CStr {
+    CStr::from_bytes_until_nul(unsafe { std::mem::transmute(name) }).unwrap()
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -47,7 +47,7 @@ fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
 
     let names: Vec<&CStr> = supported_layers
         .iter()
-        .map(|layer| unsafe { name_to_cstr(&layer.layer_name) })
+        .map(|layer| name_to_cstr(&layer.layer_name))
         .collect();
 
     if LAYERS.iter().any(|ext| !names.contains(ext)) {
@@ -77,7 +77,7 @@ fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
     let supported_extensions = entry.enumerate_instance_extension_properties(None).unwrap();
     let names: Vec<&CStr> = supported_extensions
         .iter()
-        .map(|ext| unsafe { name_to_cstr(&ext.extension_name) })
+        .map(|ext| name_to_cstr(&ext.extension_name))
         .collect();
 
     if EXTENSIONS.iter().any(|ext| !names.contains(ext)) {
@@ -439,11 +439,19 @@ impl<'a> HelloTriangleApplication<'a> {
             ..Default::default()
         };
 
-        let extensions = get_extensions(entry);
-        let validation_layers = get_validation_layers(entry);
+        let extensions = get_extensions(entry).map(CStr::as_ptr);
+        let validation_layers = get_validation_layers(entry).map(CStr::as_ptr);
+
+        let create_info = InstanceCreateInfo::builder()
+            .application_info(&app_info)
+            .enabled_extension_names(&extensions)
+            .enabled_layer_names(&validation_layers);
+
+        #[cfg(target_os = "macos")]
+        let create_info = create_info.flags(InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
 
         #[cfg(debug_assertions)]
-        let debug_create_info = DebugUtilsMessengerCreateInfoEXT {
+        let mut debug_create_info = DebugUtilsMessengerCreateInfoEXT {
             message_severity: DebugUtilsMessageSeverityFlagsEXT::VERBOSE
                 | DebugUtilsMessageSeverityFlagsEXT::INFO
                 | DebugUtilsMessageSeverityFlagsEXT::WARNING
@@ -456,19 +464,8 @@ impl<'a> HelloTriangleApplication<'a> {
             pfn_user_callback: Some(Messenger::callback),
             ..Default::default()
         };
-
-        let create_info = InstanceCreateInfo {
-            p_application_info: &app_info,
-            pp_enabled_extension_names: extensions.map(CStr::as_ptr).as_ptr(),
-            enabled_extension_count: extensions.len() as u32,
-            pp_enabled_layer_names: validation_layers.map(CStr::as_ptr).as_ptr(),
-            enabled_layer_count: validation_layers.len() as u32,
-            #[cfg(debug_assertions)]
-            p_next: &debug_create_info as *const _ as *const c_void,
-            #[cfg(target_os = "macos")]
-            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
-            ..Default::default()
-        };
+        #[cfg(debug_assertions)]
+        let create_info = create_info.push_next(&mut debug_create_info);
 
         // let exts = entry.enumerate_instance_extension_properties(None).unwrap();
 
@@ -501,19 +498,13 @@ impl<'a> HelloTriangleApplication<'a> {
             })
             .collect();
 
+        let extensions = DEVICE_EXTENSIONS.map(CStr::as_ptr);
         let device_features: PhysicalDeviceFeatures = Default::default();
 
-        let create_info = DeviceCreateInfo {
-            p_queue_create_infos: queue_create_infos.as_ptr(),
-            queue_create_info_count: queue_create_infos.len() as u32,
-
-            pp_enabled_extension_names: DEVICE_EXTENSIONS.map(CStr::as_ptr).as_ptr(),
-            enabled_extension_count: DEVICE_EXTENSIONS.len() as u32,
-
-            p_enabled_features: &device_features,
-
-            ..Default::default()
-        };
+        let create_info = DeviceCreateInfo::builder()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&extensions)
+            .enabled_features(&device_features);
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .expect("failed to create logical device!");
@@ -598,7 +589,7 @@ impl<'a> HelloTriangleApplication<'a> {
             unsafe { instance.enumerate_device_extension_properties(device) }.unwrap_or_default();
         let exts: Vec<_> = exts
             .iter()
-            .map(|prop| unsafe { name_to_cstr(&prop.extension_name) })
+            .map(|prop| name_to_cstr(&prop.extension_name))
             .collect();
 
         DEVICE_EXTENSIONS.into_iter().all(|ext| exts.contains(&ext))
