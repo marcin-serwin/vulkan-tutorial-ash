@@ -220,7 +220,7 @@ struct DeviceInfo {
 }
 
 struct HelloTriangleApplication<'a> {
-    entry: Entry,
+    entry: &'a Entry,
     instance: Instance,
     window: &'a Window,
     surface: SurfaceKHR,
@@ -249,7 +249,7 @@ struct HelloTriangleApplication<'a> {
 }
 
 impl<'a> HelloTriangleApplication<'a> {
-    fn new(entry: Entry, window: &'a Window) -> Self {
+    fn new(entry: &'a Entry, window: &'a Window) -> Self {
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
@@ -1192,15 +1192,10 @@ impl<'a> HelloTriangleApplication<'a> {
             self.render_pass,
         );
     }
-}
 
-impl<'a> Drop for HelloTriangleApplication<'a> {
-    fn drop(&mut self) {
+    fn cleanup(&mut self) -> std::result::Result<(), Result> {
         unsafe {
-            self.device_info
-                .device
-                .device_wait_idle()
-                .expect("failed while waiting for device idle");
+            self.device_info.device.device_wait_idle()?;
 
             self.sync_objects
                 .image_available_semaphores
@@ -1234,6 +1229,29 @@ impl<'a> Drop for HelloTriangleApplication<'a> {
 
             self.instance.destroy_instance(None);
         }
+        Ok(())
+    }
+
+    fn safe_drop(mut self) -> std::result::Result<(), (Self, Result)> {
+        match self.cleanup() {
+            Ok(res) => {
+                std::mem::forget(self);
+                Ok(res)
+            }
+            Err(err) => Err((self, err)),
+        }
+    }
+}
+
+impl<'a> Drop for HelloTriangleApplication<'a> {
+    fn drop(&mut self) {
+        if self.cleanup().is_err() {
+            if std::thread::panicking() {
+                eprintln!("failed to cleanup app during panicking");
+            } else {
+                panic!("failed to cleanup app");
+            }
+        }
     }
 }
 
@@ -1243,7 +1261,7 @@ fn main() {
 
     let entry = Entry::linked();
 
-    let mut app = HelloTriangleApplication::new(entry, &window);
+    let mut app = HelloTriangleApplication::new(&entry, &window);
 
     let mat = glm::mat2(1., 2., 3., 4.);
     let v = glm::vec2(1., 2.);
@@ -1262,23 +1280,23 @@ fn main() {
                 elwt.exit();
             }
             Event::WindowEvent {
-                window_id: _,
                 event: WindowEvent::Resized(size),
+                ..
             } => {
                 println!("Resized {size:?}");
                 app.occluded = size.width == 0 || size.height == 0;
                 app.recreate_swap_chain();
             }
             Event::WindowEvent {
-                window_id: _,
                 event: WindowEvent::Occluded(is_occluded),
+                ..
             } => {
                 println!("Occluded: {is_occluded:?}");
                 app.occluded = is_occluded;
             }
             Event::WindowEvent {
-                window_id: _,
                 event: WindowEvent::RedrawRequested,
+                ..
             } => {
                 println!("Redraw requested");
                 app.draw_frame();
@@ -1288,4 +1306,8 @@ fn main() {
             }
         })
         .unwrap();
+
+    app.safe_drop()
+        .map_err(|(_, e)| e)
+        .expect("failed to drop the app");
 }
