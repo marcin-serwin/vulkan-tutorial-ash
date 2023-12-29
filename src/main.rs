@@ -31,9 +31,14 @@ macro_rules! cstr {
 }
 
 macro_rules! offset_of {
-    ($struct:ident, $field:ident) => {{
-        const STRUCT: *const $struct = 0 as *const $struct;
-        (unsafe { std::ptr::addr_of!(((*STRUCT).$field)) } as usize)
+    ($ty:ident, $field:ident) => {{
+        const OFFSET: usize = {
+            let s = std::mem::MaybeUninit::<$ty>::uninit();
+            let s_ptr = s.as_ptr();
+            let f_ptr = unsafe { std::ptr::addr_of!((*s_ptr).$field) };
+            (unsafe { f_ptr.cast::<u8>().offset_from(s_ptr.cast::<u8>()) }) as usize
+        };
+        OFFSET
     }};
 }
 
