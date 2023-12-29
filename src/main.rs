@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 #[cfg(debug_assertions)]
@@ -182,8 +183,9 @@ struct SwapChainSupportDetails {
 
 #[derive(Debug, Default)]
 struct PartialQueueFamilyIndices {
-    graphics_family: Option<u32>,
-    present_family: Option<u32>,
+    graphics: Option<u32>,
+    present: Option<u32>,
+    transfer: Option<u32>,
 }
 
 impl PartialQueueFamilyIndices {
@@ -193,21 +195,31 @@ impl PartialQueueFamilyIndices {
 
     fn as_total(&self) -> Option<QueueFamilyIndices> {
         Some(QueueFamilyIndices {
-            graphics_family: self.graphics_family?,
-            present_family: self.present_family?,
+            graphics: self.graphics?,
+            present: self.present?,
+            transfer: self.transfer?,
         })
     }
 }
 
 #[derive(Debug, Default)]
 struct QueueFamilyIndices {
-    graphics_family: u32,
-    present_family: u32,
+    graphics: u32,
+    present: u32,
+    transfer: u32,
 }
 
-struct QueueFamily {
-    graphics_queue: Queue,
-    present_queue: Queue,
+struct QueueWrapper {
+    handle: Queue,
+    index: u32,
+}
+impl QueueWrapper {
+    fn new(device: &Device, index: u32) -> Self {
+        Self {
+            handle: unsafe { device.get_device_queue(index, 0) },
+            index,
+        }
+    }
 }
 
 struct SwapChainData {
@@ -218,9 +230,9 @@ struct SwapChainData {
 }
 
 struct SyncObjects {
-    image_available_semaphores: [Semaphore; MAX_FRAMES_IN_FLIGHT],
-    render_finished_semaphores: [Semaphore; MAX_FRAMES_IN_FLIGHT],
-    in_flight_fences: [Fence; MAX_FRAMES_IN_FLIGHT],
+    image_available_semaphore: Semaphore,
+    render_finished_semaphore: Semaphore,
+    in_flight_fence: Fence,
 }
 
 struct DeviceInfo {
@@ -228,6 +240,159 @@ struct DeviceInfo {
     physical_device: PhysicalDevice,
     swap_chain_support: SwapChainSupportDetails,
     queue_indices: QueueFamilyIndices,
+}
+
+struct CommandPoolWrapper {
+    command_pool: CommandPool,
+    sync_objects: [SyncObjects; MAX_FRAMES_IN_FLIGHT],
+    command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
+    queue: QueueWrapper,
+    current_frame: RefCell<usize>,
+}
+
+impl CommandPoolWrapper {
+    fn new(device: &Device, queue: QueueWrapper) -> CommandPoolWrapper {
+        let pool_info = CommandPoolCreateInfo {
+            flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            queue_family_index: queue.index,
+
+            ..Default::default()
+        };
+
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .expect("failed to create command pool");
+
+        let command_buffers = Self::create_command_buffers(device, command_pool);
+        let sync_objects = [
+            Self::create_sync_objects(&device),
+            Self::create_sync_objects(&device),
+        ];
+        Self {
+            command_pool,
+            command_buffers,
+            sync_objects,
+            queue,
+            current_frame: RefCell::new(0),
+        }
+    }
+
+    fn create_command_buffers(
+        device: &Device,
+        command_pool: CommandPool,
+    ) -> [CommandBuffer; MAX_FRAMES_IN_FLIGHT] {
+        let alloc_info = CommandBufferAllocateInfo {
+            command_pool,
+            level: CommandBufferLevel::PRIMARY,
+            command_buffer_count: MAX_FRAMES_IN_FLIGHT as u32,
+            ..Default::default()
+        };
+
+        unsafe { device.allocate_command_buffers(&alloc_info) }
+            .expect("failed to allocate command buffers!")
+            .try_into()
+            .expect("incorrect number of buffers returned")
+    }
+
+    fn create_sync_objects(device: &Device) -> SyncObjects {
+        let semaphore_info = SemaphoreCreateInfo::default();
+        let fence_info = FenceCreateInfo {
+            flags: FenceCreateFlags::SIGNALED,
+
+            ..Default::default()
+        };
+
+        let semaphore_init = || unsafe {
+            device
+                .create_semaphore(&semaphore_info, None)
+                .expect("failed to create semaphore")
+        };
+        let fence_init = || unsafe {
+            device
+                .create_fence(&fence_info, None)
+                .expect("failed to create fence")
+        };
+
+        SyncObjects {
+            image_available_semaphore: semaphore_init(),
+            render_finished_semaphore: semaphore_init(),
+            in_flight_fence: fence_init(),
+        }
+    }
+
+    fn draw_frame(
+        &self,
+        device: &Device,
+        current_frame: usize,
+        acquire_next_image: impl FnOnce(Semaphore) -> std::result::Result<u32, Result>,
+        record_command_buffer: impl FnOnce(CommandBuffer, u32) -> (),
+    ) -> std::result::Result<(u32, [Semaphore; 1]), Result> {
+        let SyncObjects {
+            image_available_semaphore: img_available,
+            render_finished_semaphore: render_finished,
+            in_flight_fence: in_flight,
+        } = self.sync_objects[current_frame];
+        let command_buffer = self.command_buffers[current_frame];
+
+        unsafe {
+            device
+                .wait_for_fences(&[in_flight], true, u64::MAX)
+                .expect("failed to wait for fence");
+        }
+
+        let image_index = acquire_next_image(img_available)?;
+
+        unsafe {
+            device
+                .reset_fences(&[in_flight])
+                .expect("failed to reset fence");
+        }
+
+        unsafe {
+            device
+                .reset_command_buffer(command_buffer, CommandBufferResetFlags::empty())
+                .expect("failed to reset command buffer");
+
+            record_command_buffer(command_buffer, image_index);
+        }
+
+        let wait_semaphores = [img_available];
+        let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let cmd_buffers = [command_buffer];
+        let signal_semaphores = [render_finished];
+
+        let submit_info = SubmitInfo::builder()
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(&cmd_buffers)
+            .signal_semaphores(&signal_semaphores);
+
+        unsafe {
+            device
+                .queue_submit(self.queue.handle, &[*submit_info], in_flight)
+                .expect("failed to submit draw command buffer!")
+        };
+
+        let mut current_frame = self.current_frame.borrow_mut();
+        *current_frame = (*current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        Ok((image_index, signal_semaphores))
+    }
+
+    unsafe fn cleanup(&mut self, device: &Device) {
+        self.sync_objects.iter().for_each(
+            |&SyncObjects {
+                 image_available_semaphore,
+                 render_finished_semaphore,
+                 in_flight_fence,
+             }| {
+                device.destroy_semaphore(image_available_semaphore, None);
+                device.destroy_semaphore(render_finished_semaphore, None);
+                device.destroy_fence(in_flight_fence, None);
+            },
+        );
+
+        device.destroy_command_pool(self.command_pool, None);
+    }
 }
 
 struct HelloTriangleApplication<'a> {
@@ -239,7 +404,6 @@ struct HelloTriangleApplication<'a> {
     swapchain_fns: Swapchain,
     occluded: bool,
 
-    queue_family: QueueFamily,
     swap_chain: SwapChainData,
     image_views: Vec<ImageView>,
 
@@ -252,10 +416,10 @@ struct HelloTriangleApplication<'a> {
 
     vertex_buffer: (Buffer, DeviceMemory),
 
-    command_pool: CommandPool,
-    command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
+    graphics_command_pool: CommandPoolWrapper,
+    transfer_command_pool: CommandPoolWrapper,
+    present_queue: QueueWrapper,
 
-    sync_objects: SyncObjects,
     current_frame: usize,
 
     #[cfg(debug_assertions)]
@@ -290,15 +454,6 @@ impl<'a> HelloTriangleApplication<'a> {
         let device_info = Self::create_logical_device(&entry, &instance, surface);
         let device = &device_info.device;
 
-        let queue_family = QueueFamily {
-            graphics_queue: unsafe {
-                device.get_device_queue(device_info.queue_indices.graphics_family, 0)
-            },
-            present_queue: unsafe {
-                device.get_device_queue(device_info.queue_indices.present_family, 0)
-            },
-        };
-
         let vertex_buffer = Self::create_vertex_buffer(&instance, &device_info, &vertices);
 
         let swapchain_fns = Swapchain::new(&instance, &device);
@@ -315,12 +470,19 @@ impl<'a> HelloTriangleApplication<'a> {
         let framebuffers =
             Self::create_framebuffers(&device, &swap_chain, &image_views, render_pass);
 
+        let queue_indices = &device_info.queue_indices;
+
         let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
 
-        let command_pool = Self::create_command_pool(&device, &device_info.queue_indices);
-        let command_buffers = Self::create_command_buffers(&device, command_pool);
-
-        let sync_objects = Self::create_sync_objects(&device);
+        let graphics_command_pool = CommandPoolWrapper::new(
+            &device,
+            QueueWrapper::new(device, device_info.queue_indices.graphics),
+        );
+        let transfer_command_pool = CommandPoolWrapper::new(
+            &device,
+            QueueWrapper::new(device, device_info.queue_indices.transfer),
+        );
+        let present_queue = QueueWrapper::new(device, queue_indices.present);
 
         Self {
             entry,
@@ -334,7 +496,6 @@ impl<'a> HelloTriangleApplication<'a> {
             vertices,
             vertex_buffer,
 
-            queue_family,
             swap_chain,
             image_views,
 
@@ -345,10 +506,10 @@ impl<'a> HelloTriangleApplication<'a> {
 
             framebuffers,
 
-            command_pool,
-            command_buffers,
+            graphics_command_pool,
+            transfer_command_pool,
+            present_queue,
 
-            sync_objects,
             current_frame: 0,
 
             #[cfg(debug_assertions)]
@@ -360,66 +521,33 @@ impl<'a> HelloTriangleApplication<'a> {
         if self.occluded {
             return;
         }
-        let in_flight = self.sync_objects.in_flight_fences[self.current_frame];
-        let img_available = self.sync_objects.image_available_semaphores[self.current_frame];
-        let render_finished = self.sync_objects.render_finished_semaphores[self.current_frame];
-        let command_buffer = self.command_buffers[self.current_frame];
 
-        unsafe {
-            self.device_info
-                .device
-                .wait_for_fences(&[in_flight], true, u64::MAX)
-                .expect("failed to wait for fence");
-        }
-
-        let image_index = unsafe {
-            match self.swapchain_fns.acquire_next_image(
+        let acquire_image_index = |img_available| match unsafe {
+            self.swapchain_fns.acquire_next_image(
                 self.swap_chain.chain,
                 u64::MAX,
                 img_available,
                 Fence::null(),
-            ) {
-                Ok((index, _)) => index,
-                Err(Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swap_chain();
-                    return;
-                }
-                _ => panic!("failed to acquire next image from swap chain"),
-            }
+            )
+        } {
+            Ok((index, _)) => Ok(index),
+            Err(err @ Result::ERROR_OUT_OF_DATE_KHR) => Err(err),
+
+            _ => panic!("failed to acquire next image from swap chain"),
         };
 
-        unsafe {
-            self.device_info
-                .device
-                .reset_fences(&[in_flight])
-                .expect("failed to reset fence");
-        }
-
-        unsafe {
-            self.device_info
-                .device
-                .reset_command_buffer(command_buffer, CommandBufferResetFlags::empty())
-                .expect("failed to reset command buffer");
-
-            self.record_command_buffer(command_buffer, image_index);
-        }
-
-        let wait_semaphores = [img_available];
-        let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let cmd_buffers = [command_buffer];
-        let signal_semaphores = [render_finished];
-
-        let submit_info = SubmitInfo::builder()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&cmd_buffers)
-            .signal_semaphores(&signal_semaphores);
-
-        unsafe {
-            self.device_info
-                .device
-                .queue_submit(self.queue_family.graphics_queue, &[*submit_info], in_flight)
-                .expect("failed to submit draw command buffer!")
+        let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
+            &self.device_info.device,
+            self.current_frame,
+            acquire_image_index,
+            |buffer, image_index| self.record_command_buffer(buffer, image_index),
+        ) {
+            Ok(i) => i,
+            Err(Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate_swap_chain();
+                return;
+            }
+            _ => panic!("failed to draw frame"),
         };
 
         let swapchains = [self.swap_chain.chain];
@@ -429,17 +557,14 @@ impl<'a> HelloTriangleApplication<'a> {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        unsafe {
-            match self
-                .swapchain_fns
-                .queue_present(self.queue_family.present_queue, &present_info)
-            {
-                Ok(false) => (),
-                Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swap_chain(),
-                _ => panic!("failed to present queue"),
-            }
+        match unsafe {
+            self.swapchain_fns
+                .queue_present(self.present_queue.handle, &present_info)
+        } {
+            Ok(false) => (),
+            Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swap_chain(),
+            _ => panic!("failed to present queue"),
         }
-        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     fn create_surface(entry: &Entry, instance: &Instance, window: &Window) -> SurfaceKHR {
@@ -554,8 +679,9 @@ impl<'a> HelloTriangleApplication<'a> {
 
         let unique_indices = {
             let mut set = HashSet::new();
-            set.insert(queue_indices.graphics_family);
-            set.insert(queue_indices.present_family);
+            set.insert(queue_indices.graphics);
+            set.insert(queue_indices.present);
+            set.insert(queue_indices.transfer);
             set
         };
 
@@ -603,15 +729,20 @@ impl<'a> HelloTriangleApplication<'a> {
 
         for (index, queue) in props.into_iter().enumerate() {
             let index = index as u32;
+            if queue.queue_flags.contains(QueueFlags::TRANSFER)
+                && !queue.queue_flags.contains(QueueFlags::GRAPHICS)
+            {
+                result.transfer = Some(index);
+            }
             if queue.queue_flags.contains(QueueFlags::GRAPHICS) {
-                result.graphics_family = Some(index);
+                result.graphics = Some(index);
             }
             if unsafe {
                 surface_fn
                     .get_physical_device_surface_support(device, index, surface)
                     .unwrap_or(false)
             } {
-                result.present_family = Some(index);
+                result.present = Some(index);
             }
 
             if result.is_total() {
@@ -711,17 +842,14 @@ impl<'a> HelloTriangleApplication<'a> {
             },
         );
 
-        let queue_indices = [
-            queue_family_indices.graphics_family,
-            queue_family_indices.present_family,
-        ];
+        let queue_indices = [queue_family_indices.graphics, queue_family_indices.present];
 
-        let queue_indices: &[u32] =
-            if queue_family_indices.graphics_family == queue_family_indices.present_family {
-                &[]
-            } else {
-                &queue_indices
-            };
+        let queue_indices: &[u32] = if queue_family_indices.graphics == queue_family_indices.present
+        {
+            &[]
+        } else {
+            &queue_indices
+        };
 
         let create_info = SwapchainCreateInfoKHR {
             surface,
@@ -1053,38 +1181,6 @@ impl<'a> HelloTriangleApplication<'a> {
             .collect()
     }
 
-    fn create_command_pool(
-        device: &Device,
-        queue_family_indices: &QueueFamilyIndices,
-    ) -> CommandPool {
-        let pool_info = CommandPoolCreateInfo {
-            flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-            queue_family_index: queue_family_indices.graphics_family,
-
-            ..Default::default()
-        };
-
-        unsafe { device.create_command_pool(&pool_info, None) }
-            .expect("failed to create framebuffer!")
-    }
-
-    fn create_command_buffers(
-        device: &Device,
-        command_pool: CommandPool,
-    ) -> [CommandBuffer; MAX_FRAMES_IN_FLIGHT] {
-        let alloc_info = CommandBufferAllocateInfo {
-            command_pool,
-            level: CommandBufferLevel::PRIMARY,
-            command_buffer_count: MAX_FRAMES_IN_FLIGHT as u32,
-            ..Default::default()
-        };
-
-        unsafe { device.allocate_command_buffers(&alloc_info) }
-            .expect("failed to allocate command buffers!")
-            .try_into()
-            .expect("incorrect number of buffers returned")
-    }
-
     fn record_command_buffer(&self, command_buffer: CommandBuffer, image_index: u32) {
         let device = &self.device_info.device;
         let begin_info = CommandBufferBeginInfo::default();
@@ -1150,33 +1246,6 @@ impl<'a> HelloTriangleApplication<'a> {
         }
     }
 
-    fn create_sync_objects(device: &Device) -> SyncObjects {
-        let semaphore_info = SemaphoreCreateInfo::default();
-        let fence_info = FenceCreateInfo {
-            flags: FenceCreateFlags::SIGNALED,
-
-            ..Default::default()
-        };
-
-        const UNIT_ARRAY: [(); MAX_FRAMES_IN_FLIGHT] = [(); MAX_FRAMES_IN_FLIGHT];
-        let semaphore_init = |_| unsafe {
-            device
-                .create_semaphore(&semaphore_info, None)
-                .expect("failed to create semaphore")
-        };
-        let fence_init = |_| unsafe {
-            device
-                .create_fence(&fence_info, None)
-                .expect("failed to create fence")
-        };
-
-        SyncObjects {
-            image_available_semaphores: UNIT_ARRAY.map(semaphore_init),
-            render_finished_semaphores: UNIT_ARRAY.map(semaphore_init),
-            in_flight_fences: UNIT_ARRAY.map(fence_init),
-        }
-    }
-
     unsafe fn cleanup_swap_chain(&mut self) {
         self.framebuffers
             .iter()
@@ -1228,17 +1297,6 @@ impl<'a> HelloTriangleApplication<'a> {
         unsafe {
             self.device_info.device.device_wait_idle()?;
 
-            self.sync_objects
-                .image_available_semaphores
-                .iter()
-                .chain(self.sync_objects.render_finished_semaphores.iter())
-                .for_each(|&sem| self.device_info.device.destroy_semaphore(sem, None));
-
-            self.sync_objects
-                .in_flight_fences
-                .iter()
-                .for_each(|&fence| self.device_info.device.destroy_fence(fence, None));
-
             self.cleanup_swap_chain();
 
             self.device_info
@@ -1248,9 +1306,8 @@ impl<'a> HelloTriangleApplication<'a> {
                 .device
                 .destroy_buffer(self.vertex_buffer.0, None);
 
-            self.device_info
-                .device
-                .destroy_command_pool(self.command_pool, None);
+            self.graphics_command_pool.cleanup(&self.device_info.device);
+            self.transfer_command_pool.cleanup(&self.device_info.device);
 
             self.device_info
                 .device
