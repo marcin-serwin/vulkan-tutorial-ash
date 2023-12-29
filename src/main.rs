@@ -43,18 +43,22 @@ fn name_to_cstr(name: &[c_char]) -> &CStr {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-#[cfg(not(target_os = "macos"))]
-const DEVICE_EXTENSIONS: [&CStr; 1] = [KhrSwapchainFn::name()];
-#[cfg(target_os = "macos")]
-const DEVICE_EXTENSIONS: [&CStr; 2] = [KhrSwapchainFn::name(), KhrPortabilitySubsetFn::name()];
+const DEVICE_EXTENSIONS: [&CStr; 1 + cfg!(target_os = "macos") as usize] = [
+    KhrSwapchainFn::name(),
+    #[cfg(target_os = "macos")]
+    KhrPortabilitySubsetFn::name(),
+];
 
-#[cfg(not(debug_assertions))]
-const LAYERS: [&CStr; 0] = [];
-#[cfg(debug_assertions)]
-const LAYERS: [&CStr; 1] = [cstr!("VK_LAYER_KHRONOS_validation")];
+const LAYERS: &[&CStr] = &[
+    #[cfg(debug_assertions)]
+    cstr!("VK_LAYER_KHRONOS_validation"),
+];
 fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
-    if LAYERS.is_empty() {
-        return LAYERS;
+    let layers: [&CStr; LAYERS.len()] = LAYERS
+        .try_into()
+        .expect("This is a constant slice with known length");
+    if layers.is_empty() {
+        return layers;
     }
     let supported_layers = entry.enumerate_instance_layer_properties().unwrap();
 
@@ -63,40 +67,33 @@ fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
         .map(|layer| name_to_cstr(&layer.layer_name))
         .collect();
 
-    if LAYERS.iter().any(|ext| !names.contains(ext)) {
+    if layers.iter().any(|ext| !names.contains(ext)) {
         panic!("Required validation layer not found");
     }
 
-    LAYERS
+    layers
 }
 
-#[cfg(all(target_os = "linux", not(debug_assertions)))]
-const EXTENSIONS: [&CStr; 2] = [KhrSurfaceFn::name(), KhrWaylandSurfaceFn::name()];
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
-const EXTENSIONS: [&CStr; 4] = [
-    KhrPortabilityEnumerationFn::name(),
+const EXTENSIONS: &[&CStr] = &[
     KhrSurfaceFn::name(),
-    ExtMetalSurfaceFn::name(),
-    KhrGetPhysicalDeviceProperties2Fn::name(),
-];
-#[cfg(all(target_os = "linux", debug_assertions))]
-const EXTENSIONS: [&CStr; 3] = [
-    KhrSurfaceFn::name(),
+    #[cfg(target_os = "linux")]
     KhrWaylandSurfaceFn::name(),
-    ExtDebugUtilsFn::name(),
-];
-#[cfg(all(target_os = "macos", debug_assertions))]
-const EXTENSIONS: [&CStr; 5] = [
-    KhrPortabilityEnumerationFn::name(),
-    KhrSurfaceFn::name(),
+    #[cfg(target_os = "macos")]
     ExtMetalSurfaceFn::name(),
+    #[cfg(target_os = "macos")]
+    KhrPortabilityEnumerationFn::name(),
+    #[cfg(target_os = "macos")]
     KhrGetPhysicalDeviceProperties2Fn::name(),
+    #[cfg(debug_assertions)]
     ExtDebugUtilsFn::name(),
 ];
 
 fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
-    if EXTENSIONS.is_empty() {
-        return EXTENSIONS;
+    let extensions: [&CStr; EXTENSIONS.len()] = EXTENSIONS
+        .try_into()
+        .expect("This is a constant slice with known length");
+    if extensions.is_empty() {
+        return extensions;
     }
     let supported_extensions = entry.enumerate_instance_extension_properties(None).unwrap();
     let names: Vec<&CStr> = supported_extensions
@@ -104,11 +101,11 @@ fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
         .map(|ext| name_to_cstr(&ext.extension_name))
         .collect();
 
-    if EXTENSIONS.iter().any(|ext| !names.contains(ext)) {
+    if extensions.iter().any(|ext| !names.contains(ext)) {
         panic!("Required extension not found");
     }
 
-    EXTENSIONS
+    extensions
 }
 
 struct Messenger {
