@@ -242,7 +242,64 @@ struct DeviceInfo {
     queue_indices: QueueFamilyIndices,
 }
 
-struct CommandPoolWrapper {
+struct TransferCommandPool {
+    command_pool: CommandPool,
+    queue: QueueWrapper,
+}
+
+impl TransferCommandPool {
+    fn new(device: &Device, queue: QueueWrapper) -> Self {
+        let pool_info = CommandPoolCreateInfo::builder()
+            .queue_family_index(queue.index)
+            .flags(CommandPoolCreateFlags::TRANSIENT);
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .expect("failed to create command pool");
+
+        Self {
+            command_pool,
+            queue,
+        }
+    }
+
+    fn copy_buffer(
+        &self,
+        device: &Device,
+        src_buffer: Buffer,
+        dst_buffer: Buffer,
+        size: DeviceSize,
+    ) {
+        let cmd_buffer_info = CommandBufferAllocateInfo::builder()
+            .level(CommandBufferLevel::PRIMARY)
+            .command_pool(self.command_pool)
+            .command_buffer_count(1);
+
+        let cmd_buffer = unsafe { device.allocate_command_buffers(&cmd_buffer_info) }.unwrap()[0];
+
+        let cmd_buffer_begin_info =
+            CommandBufferBeginInfo::builder().flags(CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe { device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info) }.unwrap();
+
+        let copy_region = BufferCopy::builder().size(size);
+        unsafe { device.cmd_copy_buffer(cmd_buffer, src_buffer, dst_buffer, &[*copy_region]) };
+
+        unsafe { device.end_command_buffer(cmd_buffer) }.unwrap();
+
+        let cmd_buffers = [cmd_buffer];
+        let submit_info = SubmitInfo::builder().command_buffers(&cmd_buffers);
+
+        unsafe { device.queue_submit(self.queue.handle, &[*submit_info], Fence::null()) }.unwrap();
+        unsafe { device.queue_wait_idle(self.queue.handle) }.unwrap();
+
+        unsafe { device.free_command_buffers(self.command_pool, &cmd_buffers) };
+    }
+
+    unsafe fn cleanup(&mut self, device: &Device) {
+        device.destroy_command_pool(self.command_pool, None);
+    }
+}
+
+struct GraphicsCommandPool {
     command_pool: CommandPool,
     sync_objects: [SyncObjects; MAX_FRAMES_IN_FLIGHT],
     command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
@@ -250,8 +307,8 @@ struct CommandPoolWrapper {
     current_frame: RefCell<usize>,
 }
 
-impl CommandPoolWrapper {
-    fn new(device: &Device, queue: QueueWrapper) -> CommandPoolWrapper {
+impl GraphicsCommandPool {
+    fn new(device: &Device, queue: QueueWrapper) -> GraphicsCommandPool {
         let pool_info = CommandPoolCreateInfo {
             flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             queue_family_index: queue.index,
@@ -416,8 +473,7 @@ struct HelloTriangleApplication<'a> {
 
     vertex_buffer: (Buffer, DeviceMemory),
 
-    graphics_command_pool: CommandPoolWrapper,
-    transfer_command_pool: CommandPoolWrapper,
+    graphics_command_pool: GraphicsCommandPool,
     present_queue: QueueWrapper,
 
     current_frame: usize,
@@ -454,7 +510,20 @@ impl<'a> HelloTriangleApplication<'a> {
         let device_info = Self::create_logical_device(&entry, &instance, surface);
         let device = &device_info.device;
 
-        let vertex_buffer = Self::create_vertex_buffer(&instance, &device_info, &vertices);
+        let vertex_buffer = {
+            let mut transfer_command_pool = TransferCommandPool::new(
+                &device,
+                QueueWrapper::new(device, device_info.queue_indices.transfer),
+            );
+            let buf = Self::create_vertex_buffer(
+                &instance,
+                &device_info,
+                &vertices,
+                &transfer_command_pool,
+            );
+            unsafe { transfer_command_pool.cleanup(device) };
+            buf
+        };
 
         let swapchain_fns = Swapchain::new(&instance, &device);
         let swap_chain = Self::create_swap_chain(
@@ -474,13 +543,9 @@ impl<'a> HelloTriangleApplication<'a> {
 
         let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
 
-        let graphics_command_pool = CommandPoolWrapper::new(
+        let graphics_command_pool = GraphicsCommandPool::new(
             &device,
             QueueWrapper::new(device, device_info.queue_indices.graphics),
-        );
-        let transfer_command_pool = CommandPoolWrapper::new(
-            &device,
-            QueueWrapper::new(device, device_info.queue_indices.transfer),
         );
         let present_queue = QueueWrapper::new(device, queue_indices.present);
 
@@ -507,7 +572,6 @@ impl<'a> HelloTriangleApplication<'a> {
             framebuffers,
 
             graphics_command_pool,
-            transfer_command_pool,
             present_queue,
 
             current_frame: 0,
@@ -1307,7 +1371,6 @@ impl<'a> HelloTriangleApplication<'a> {
                 .destroy_buffer(self.vertex_buffer.0, None);
 
             self.graphics_command_pool.cleanup(&self.device_info.device);
-            self.transfer_command_pool.cleanup(&self.device_info.device);
 
             self.device_info
                 .device
@@ -1327,33 +1390,34 @@ impl<'a> HelloTriangleApplication<'a> {
         Ok(())
     }
 
-    fn safe_drop(mut self) -> std::result::Result<(), (Self, Result)> {
+    fn safe_drop(mut self) -> std::result::Result<(), (ManuallyDrop<Self>, Result)> {
         match self.cleanup() {
             Ok(res) => {
                 std::mem::forget(self);
                 Ok(res)
             }
-            Err(err) => Err((self, err)),
+            Err(err) => Err((ManuallyDrop::new(self), err)),
         }
     }
 
-    fn create_vertex_buffer(
-        instance: &Instance,
-        device: &DeviceInfo,
-        vertices: &[Vertex; 3],
+    fn create_buffer(
+        device: &Device,
+        mem_props: &PhysicalDeviceMemoryProperties,
+        size: DeviceSize,
+        mem_prop_flags: MemoryPropertyFlags,
+        usage_flags: BufferUsageFlags,
     ) -> (Buffer, DeviceMemory) {
         let buffer_info = BufferCreateInfo::builder()
-            .size(std::mem::size_of_val(vertices) as u64)
-            .usage(BufferUsageFlags::VERTEX_BUFFER)
+            .size(size)
+            .usage(usage_flags)
             .sharing_mode(SharingMode::EXCLUSIVE);
 
-        let buffer = unsafe { device.device.create_buffer(&buffer_info, None) }
-            .expect("failed to create buffer");
+        let buffer =
+            unsafe { device.create_buffer(&buffer_info, None) }.expect("failed to create buffer");
 
-        let mem_requirements = unsafe { device.device.get_buffer_memory_requirements(buffer) };
+        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
         let find_memory_buffer = |type_filter: u32, props: MemoryPropertyFlags| -> u32 {
-            let mem_props =
-                unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
             mem_props
                 .memory_types
                 .iter()
@@ -1371,27 +1435,63 @@ impl<'a> HelloTriangleApplication<'a> {
             .allocation_size(mem_requirements.size)
             .memory_type_index(find_memory_buffer(
                 mem_requirements.memory_type_bits,
-                MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+                mem_prop_flags,
             ));
 
-        let memory = unsafe { device.device.allocate_memory(&alloc_info, None) }
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
             .expect("failed to allocate vertex buffer memory");
 
-        unsafe { device.device.bind_buffer_memory(buffer, memory, 0) }
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
             .expect("failed to bind buffer memory");
+
+        (buffer, memory)
+    }
+
+    fn create_vertex_buffer(
+        instance: &Instance,
+        device: &DeviceInfo,
+        vertices: &[Vertex; 3],
+        transfer_cmd_pool: &TransferCommandPool,
+    ) -> (Buffer, DeviceMemory) {
+        let mem_props =
+            unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
+        let size = std::mem::size_of_val(vertices) as u64;
+
+        let (staging_buffer, staging_memory) = Self::create_buffer(
+            &device.device,
+            &mem_props,
+            size,
+            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+            BufferUsageFlags::TRANSFER_SRC,
+        );
 
         let data = unsafe {
             device
                 .device
-                .map_memory(memory, 0, buffer_info.size, MemoryMapFlags::empty())
+                .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
         }
         .expect("failed to map memory");
 
         unsafe { std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len()) };
 
-        unsafe { device.device.unmap_memory(memory) };
+        unsafe { device.device.unmap_memory(staging_memory) };
 
-        (buffer, memory)
+        let (vertex_buffer, vertex_memory) = Self::create_buffer(
+            &device.device,
+            &mem_props,
+            size,
+            MemoryPropertyFlags::DEVICE_LOCAL,
+            BufferUsageFlags::TRANSFER_DST | BufferUsageFlags::VERTEX_BUFFER,
+        );
+
+        transfer_cmd_pool.copy_buffer(&device.device, staging_buffer, vertex_buffer, size);
+
+        unsafe {
+            device.device.destroy_buffer(staging_buffer, None);
+            device.device.free_memory(staging_memory, None);
+        }
+
+        (vertex_buffer, vertex_memory)
     }
 }
 
