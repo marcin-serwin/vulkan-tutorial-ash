@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
-#[cfg(debug_assertions)]
 use std::mem::ManuallyDrop;
 extern crate nalgebra_glm as glm;
 
@@ -408,9 +407,9 @@ impl GraphicsCommandPool {
             device
                 .reset_command_buffer(command_buffer, CommandBufferResetFlags::empty())
                 .expect("failed to reset command buffer");
-
-            record_command_buffer(command_buffer, image_index);
         }
+
+        record_command_buffer(command_buffer, image_index);
 
         let wait_semaphores = [img_available];
         let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -469,9 +468,11 @@ struct HelloTriangleApplication<'a> {
     pipeline: Pipeline,
 
     framebuffers: Vec<Framebuffer>,
-    vertices: [Vertex; 3],
+    vertices: [Vertex; 4],
+    indices: [u16; 6],
 
     vertex_buffer: (Buffer, DeviceMemory),
+    index_buffer: (Buffer, DeviceMemory),
 
     graphics_command_pool: GraphicsCommandPool,
     present_queue: QueueWrapper,
@@ -484,20 +485,26 @@ struct HelloTriangleApplication<'a> {
 
 impl<'a> HelloTriangleApplication<'a> {
     fn new(entry: &'a Entry, window: &'a Window) -> Self {
-        let vertices: [Vertex; 3] = [
+        let vertices = [
             Vertex {
-                pos: glm::vec2(0.0, -0.5),
+                pos: glm::vec2(-0.5, -0.5),
                 color: glm::vec3(1.0, 0.0, 0.0),
             },
             Vertex {
-                pos: glm::vec2(0.5, 0.5),
+                pos: glm::vec2(0.5, -0.5),
                 color: glm::vec3(0.0, 1.0, 0.0),
             },
             Vertex {
-                pos: glm::vec2(-0.5, 0.5),
+                pos: glm::vec2(0.5, 0.5),
                 color: glm::vec3(0.0, 0.0, 1.0),
             },
+            Vertex {
+                pos: glm::vec2(-0.5, 0.5),
+                color: glm::vec3(1.0, 1.0, 1.0),
+            },
         ];
+        let indices = [0, 1, 2, 2, 3, 0];
+
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
@@ -510,20 +517,15 @@ impl<'a> HelloTriangleApplication<'a> {
         let device_info = Self::create_logical_device(&entry, &instance, surface);
         let device = &device_info.device;
 
-        let vertex_buffer = {
-            let mut transfer_command_pool = TransferCommandPool::new(
-                &device,
-                QueueWrapper::new(device, device_info.queue_indices.transfer),
-            );
-            let buf = Self::create_vertex_buffer(
-                &instance,
-                &device_info,
-                &vertices,
-                &transfer_command_pool,
-            );
-            unsafe { transfer_command_pool.cleanup(device) };
-            buf
-        };
+        let mut transfer_command_pool = TransferCommandPool::new(
+            &device,
+            QueueWrapper::new(device, device_info.queue_indices.transfer),
+        );
+        let vertex_buffer =
+            Self::create_vertex_buffer(&instance, &device_info, &vertices, &transfer_command_pool);
+        let index_buffer =
+            Self::create_index_buffer(&instance, &device_info, &indices, &transfer_command_pool);
+        unsafe { transfer_command_pool.cleanup(device) };
 
         let swapchain_fns = Swapchain::new(&instance, &device);
         let swap_chain = Self::create_swap_chain(
@@ -559,7 +561,9 @@ impl<'a> HelloTriangleApplication<'a> {
             occluded,
 
             vertices,
+            indices,
             vertex_buffer,
+            index_buffer,
 
             swap_chain,
             image_views,
@@ -1301,7 +1305,9 @@ impl<'a> HelloTriangleApplication<'a> {
             let buffers = [self.vertex_buffer.0];
             device.cmd_bind_vertex_buffers(command_buffer, 0, &buffers, &[0]);
 
-            device.cmd_draw(command_buffer, self.vertices.len() as u32, 1, 0, 0);
+            device.cmd_bind_index_buffer(command_buffer, self.index_buffer.0, 0, IndexType::UINT16);
+
+            device.cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(command_buffer);
 
             device
@@ -1362,6 +1368,13 @@ impl<'a> HelloTriangleApplication<'a> {
             self.device_info.device.device_wait_idle()?;
 
             self.cleanup_swap_chain();
+
+            self.device_info
+                .device
+                .free_memory(self.index_buffer.1, None);
+            self.device_info
+                .device
+                .destroy_buffer(self.index_buffer.0, None);
 
             self.device_info
                 .device
@@ -1447,10 +1460,57 @@ impl<'a> HelloTriangleApplication<'a> {
         (buffer, memory)
     }
 
+    fn create_index_buffer(
+        instance: &Instance,
+        device: &DeviceInfo,
+        indices: &[u16],
+        transfer_cmd_pool: &TransferCommandPool,
+    ) -> (Buffer, DeviceMemory) {
+        let mem_props =
+            unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
+        let size = std::mem::size_of_val(indices) as u64;
+
+        let (staging_buffer, staging_memory) = Self::create_buffer(
+            &device.device,
+            &mem_props,
+            size,
+            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+            BufferUsageFlags::TRANSFER_SRC,
+        );
+
+        let data = unsafe {
+            device
+                .device
+                .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
+        }
+        .expect("failed to map memory");
+
+        unsafe { std::ptr::copy_nonoverlapping(indices.as_ptr(), data.cast(), indices.len()) };
+
+        unsafe { device.device.unmap_memory(staging_memory) };
+
+        let (index_buffer, index_memory) = Self::create_buffer(
+            &device.device,
+            &mem_props,
+            size,
+            MemoryPropertyFlags::DEVICE_LOCAL,
+            BufferUsageFlags::TRANSFER_DST | BufferUsageFlags::INDEX_BUFFER,
+        );
+
+        transfer_cmd_pool.copy_buffer(&device.device, staging_buffer, index_buffer, size);
+
+        unsafe {
+            device.device.destroy_buffer(staging_buffer, None);
+            device.device.free_memory(staging_memory, None);
+        }
+
+        (index_buffer, index_memory)
+    }
+
     fn create_vertex_buffer(
         instance: &Instance,
         device: &DeviceInfo,
-        vertices: &[Vertex; 3],
+        vertices: &[Vertex],
         transfer_cmd_pool: &TransferCommandPool,
     ) -> (Buffer, DeviceMemory) {
         let mem_props =
