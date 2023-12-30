@@ -2,10 +2,10 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::mem::ManuallyDrop;
-extern crate nalgebra_glm as glm;
 
 use ash::extensions::ext::DebugUtils;
 use ash::{extensions::khr::*, vk::*, Device, Entry, Instance};
+use nalgebra::*;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 #[cfg(target_os = "macos")]
@@ -236,9 +236,9 @@ struct SyncObjects {
 
 struct DeviceInfo {
     device: Device,
-    physical_device: PhysicalDevice,
     swap_chain_support: SwapChainSupportDetails,
     queue_indices: QueueFamilyIndices,
+    physical_memory_properties: PhysicalDeviceMemoryProperties,
 }
 
 struct TransferCommandPool {
@@ -298,55 +298,155 @@ impl TransferCommandPool {
     }
 }
 
-struct GraphicsCommandPool {
-    command_pool: CommandPool,
-    sync_objects: [SyncObjects; MAX_FRAMES_IN_FLIGHT],
-    command_buffers: [CommandBuffer; MAX_FRAMES_IN_FLIGHT],
-    queue: QueueWrapper,
-    current_frame: RefCell<usize>,
+struct BufferWrapper {
+    buffer: Buffer,
+    memory: DeviceMemory,
 }
 
-impl GraphicsCommandPool {
-    fn new(device: &Device, queue: QueueWrapper) -> GraphicsCommandPool {
-        let pool_info = CommandPoolCreateInfo {
-            flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-            queue_family_index: queue.index,
+impl BufferWrapper {
+    fn new(
+        device: &Device,
+        mem_props: &PhysicalDeviceMemoryProperties,
+        size: DeviceSize,
+        mem_prop_flags: MemoryPropertyFlags,
+        usage_flags: BufferUsageFlags,
+    ) -> Self {
+        let buffer_info = BufferCreateInfo::builder()
+            .size(size)
+            .usage(usage_flags)
+            .sharing_mode(SharingMode::EXCLUSIVE);
 
-            ..Default::default()
+        let buffer =
+            unsafe { device.create_buffer(&buffer_info, None) }.expect("failed to create buffer");
+
+        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let find_memory_buffer = |type_filter: u32, props: MemoryPropertyFlags| -> u32 {
+            mem_props
+                .memory_types
+                .iter()
+                .take(mem_props.memory_type_count as usize)
+                .enumerate()
+                .filter(|(index, typ)| {
+                    (type_filter & (1 << index)) != 0 && typ.property_flags.contains(props)
+                })
+                .next()
+                .expect("failed to find suitable memory type")
+                .0 as u32
         };
 
-        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .expect("failed to create command pool");
+        let alloc_info = MemoryAllocateInfo::builder()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(find_memory_buffer(
+                mem_requirements.memory_type_bits,
+                mem_prop_flags,
+            ));
 
-        let command_buffers = Self::create_command_buffers(device, command_pool);
-        let sync_objects = [
-            Self::create_sync_objects(&device),
-            Self::create_sync_objects(&device),
-        ];
-        Self {
-            command_pool,
-            command_buffers,
-            sync_objects,
-            queue,
-            current_frame: RefCell::new(0),
-        }
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+            .expect("failed to allocate vertex buffer memory");
+
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .expect("failed to bind buffer memory");
+
+        Self { buffer, memory }
     }
 
-    fn create_command_buffers(
-        device: &Device,
-        command_pool: CommandPool,
-    ) -> [CommandBuffer; MAX_FRAMES_IN_FLIGHT] {
-        let alloc_info = CommandBufferAllocateInfo {
-            command_pool,
-            level: CommandBufferLevel::PRIMARY,
-            command_buffer_count: MAX_FRAMES_IN_FLIGHT as u32,
-            ..Default::default()
+    fn create_buffer_with_staging<T>(
+        device: &DeviceInfo,
+        data: &T,
+        transfer_cmd_pool: &TransferCommandPool,
+        usage: BufferUsageFlags,
+    ) -> BufferWrapper {
+        let size = std::mem::size_of_val(data) as u64;
+
+        let BufferWrapper {
+            buffer: staging_buffer,
+            memory: staging_memory,
+        } = BufferWrapper::new(
+            &device.device,
+            &device.physical_memory_properties,
+            size,
+            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+            BufferUsageFlags::TRANSFER_SRC,
+        );
+
+        let data = unsafe {
+            device
+                .device
+                .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
+        }
+        .expect("failed to map memory");
+
+        unsafe { std::ptr::copy_nonoverlapping(data as *const _, data.cast(), 1) };
+
+        unsafe { device.device.unmap_memory(staging_memory) };
+
+        let result @ BufferWrapper { buffer, .. } = BufferWrapper::new(
+            &device.device,
+            &device.physical_memory_properties,
+            size,
+            MemoryPropertyFlags::DEVICE_LOCAL,
+            BufferUsageFlags::TRANSFER_DST | usage,
+        );
+
+        transfer_cmd_pool.copy_buffer(&device.device, staging_buffer, buffer, size);
+
+        unsafe {
+            device.device.destroy_buffer(staging_buffer, None);
+            device.device.free_memory(staging_memory, None);
+        }
+
+        result
+    }
+
+    fn create_mapped_buffer(device: &DeviceInfo, size: DeviceSize) -> (Self, *mut c_void) {
+        let buffer = Self::new(
+            &device.device,
+            &device.physical_memory_properties,
+            size,
+            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+            BufferUsageFlags::UNIFORM_BUFFER,
+        );
+
+        let ptr = unsafe {
+            device
+                .device
+                .map_memory(buffer.memory, 0, size, MemoryMapFlags::empty())
+                .unwrap()
         };
 
-        unsafe { device.allocate_command_buffers(&alloc_info) }
-            .expect("failed to allocate command buffers!")
-            .try_into()
-            .expect("incorrect number of buffers returned")
+        (buffer, ptr)
+    }
+
+    unsafe fn cleanup(&mut self, device: &Device) {
+        device.free_memory(self.memory, None);
+        device.destroy_buffer(self.buffer, None);
+    }
+}
+
+struct InFlightBuffers {
+    sync_objects: SyncObjects,
+    command_buffer: CommandBuffer,
+    uniform_buffer: BufferWrapper,
+    ub_map: *mut UniformBufferObject,
+}
+
+impl InFlightBuffers {
+    fn new(
+        device: &DeviceInfo,
+        command_buffer: CommandBuffer,
+        uniform_buffer_size: DeviceSize,
+    ) -> Self {
+        let sync_objects = Self::create_sync_objects(&device.device);
+        let (uniform_buffer, ub_map) =
+            BufferWrapper::create_mapped_buffer(device, uniform_buffer_size);
+
+        Self {
+            command_buffer,
+            sync_objects,
+            uniform_buffer,
+            ub_map: ub_map.cast(),
+        }
     }
 
     fn create_sync_objects(device: &Device) -> SyncObjects {
@@ -375,19 +475,96 @@ impl GraphicsCommandPool {
         }
     }
 
+    unsafe fn cleanup(&mut self, device: &Device) {
+        let SyncObjects {
+            image_available_semaphore,
+            render_finished_semaphore,
+            in_flight_fence,
+        } = self.sync_objects;
+
+        device.destroy_semaphore(image_available_semaphore, None);
+        device.destroy_semaphore(render_finished_semaphore, None);
+        device.destroy_fence(in_flight_fence, None);
+
+        self.uniform_buffer.cleanup(device);
+    }
+}
+
+struct GraphicsCommandPool {
+    command_pool: CommandPool,
+
+    in_flight_buffers: [InFlightBuffers; MAX_FRAMES_IN_FLIGHT],
+    queue: QueueWrapper,
+
+    current_frame: RefCell<usize>,
+}
+
+impl GraphicsCommandPool {
+    fn new(device: &DeviceInfo, queue: QueueWrapper) -> Self {
+        let pool_info = CommandPoolCreateInfo {
+            flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            queue_family_index: queue.index,
+
+            ..Default::default()
+        };
+
+        let command_pool = unsafe { device.device.create_command_pool(&pool_info, None) }
+            .expect("failed to create command pool");
+
+        let command_buffers = Self::create_command_buffers(&device.device, command_pool);
+
+        let in_flight_buffers = command_buffers.map(|cmd_buffer| {
+            InFlightBuffers::new(
+                device,
+                cmd_buffer,
+                std::mem::size_of::<UniformBufferObject>() as DeviceSize,
+            )
+        });
+
+        Self {
+            command_pool,
+            queue,
+            current_frame: RefCell::new(0),
+            in_flight_buffers,
+        }
+    }
+
+    fn create_command_buffers(
+        device: &Device,
+        command_pool: CommandPool,
+    ) -> [CommandBuffer; MAX_FRAMES_IN_FLIGHT] {
+        let alloc_info = CommandBufferAllocateInfo {
+            command_pool,
+            level: CommandBufferLevel::PRIMARY,
+            command_buffer_count: MAX_FRAMES_IN_FLIGHT as u32,
+            ..Default::default()
+        };
+
+        unsafe { device.allocate_command_buffers(&alloc_info) }
+            .expect("failed to allocate command buffers!")
+            .try_into()
+            .expect("incorrect number of buffers returned")
+    }
+
     fn draw_frame(
         &self,
         device: &Device,
-        current_frame: usize,
         acquire_next_image: impl FnOnce(Semaphore) -> std::result::Result<u32, Result>,
         record_command_buffer: impl FnOnce(CommandBuffer, u32) -> (),
+        update_uniform_buffer: impl FnOnce(*mut UniformBufferObject) -> (),
     ) -> std::result::Result<(u32, [Semaphore; 1]), Result> {
-        let SyncObjects {
-            image_available_semaphore: img_available,
-            render_finished_semaphore: render_finished,
-            in_flight_fence: in_flight,
-        } = self.sync_objects[current_frame];
-        let command_buffer = self.command_buffers[current_frame];
+        let mut current_frame = self.current_frame.borrow_mut();
+        let InFlightBuffers {
+            sync_objects:
+                SyncObjects {
+                    image_available_semaphore: img_available,
+                    render_finished_semaphore: render_finished,
+                    in_flight_fence: in_flight,
+                },
+            command_buffer,
+            ub_map,
+            ..
+        } = self.in_flight_buffers[*current_frame];
 
         unsafe {
             device
@@ -410,6 +587,7 @@ impl GraphicsCommandPool {
         }
 
         record_command_buffer(command_buffer, image_index);
+        update_uniform_buffer(ub_map);
 
         let wait_semaphores = [img_available];
         let wait_stages = [PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -428,25 +606,15 @@ impl GraphicsCommandPool {
                 .expect("failed to submit draw command buffer!")
         };
 
-        let mut current_frame = self.current_frame.borrow_mut();
         *current_frame = (*current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         Ok((image_index, signal_semaphores))
     }
 
     unsafe fn cleanup(&mut self, device: &Device) {
-        self.sync_objects.iter().for_each(
-            |&SyncObjects {
-                 image_available_semaphore,
-                 render_finished_semaphore,
-                 in_flight_fence,
-             }| {
-                device.destroy_semaphore(image_available_semaphore, None);
-                device.destroy_semaphore(render_finished_semaphore, None);
-                device.destroy_fence(in_flight_fence, None);
-            },
-        );
-
+        self.in_flight_buffers
+            .iter_mut()
+            .for_each(|buf| buf.cleanup(device));
         device.destroy_command_pool(self.command_pool, None);
     }
 }
@@ -464,6 +632,7 @@ struct HelloTriangleApplication<'a> {
     image_views: Vec<ImageView>,
 
     render_pass: RenderPass,
+    descriptor_set_layout: DescriptorSetLayout,
     pipeline_layout: PipelineLayout,
     pipeline: Pipeline,
 
@@ -471,13 +640,13 @@ struct HelloTriangleApplication<'a> {
     vertices: [Vertex; 4],
     indices: [u16; 6],
 
-    vertex_buffer: (Buffer, DeviceMemory),
-    index_buffer: (Buffer, DeviceMemory),
+    vertex_buffer: BufferWrapper,
+    index_buffer: BufferWrapper,
 
     graphics_command_pool: GraphicsCommandPool,
     present_queue: QueueWrapper,
 
-    current_frame: usize,
+    start_time: std::time::Instant,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -487,20 +656,20 @@ impl<'a> HelloTriangleApplication<'a> {
     fn new(entry: &'a Entry, window: &'a Window) -> Self {
         let vertices = [
             Vertex {
-                pos: glm::vec2(-0.5, -0.5),
-                color: glm::vec3(1.0, 0.0, 0.0),
+                pos: Point2::new(-0.5, -0.5),
+                color: Color([1.0, 0.0, 0.0]),
             },
             Vertex {
-                pos: glm::vec2(0.5, -0.5),
-                color: glm::vec3(0.0, 1.0, 0.0),
+                pos: Point2::new(0.5, -0.5),
+                color: Color([0.0, 1.0, 0.0]),
             },
             Vertex {
-                pos: glm::vec2(0.5, 0.5),
-                color: glm::vec3(0.0, 0.0, 1.0),
+                pos: Point2::new(0.5, 0.5),
+                color: Color([0.0, 0.0, 1.0]),
             },
             Vertex {
-                pos: glm::vec2(-0.5, 0.5),
-                color: glm::vec3(1.0, 1.0, 1.0),
+                pos: Point2::new(-0.5, 0.5),
+                color: Color([1.0, 1.0, 1.0]),
             },
         ];
         let indices = [0, 1, 2, 2, 3, 0];
@@ -521,10 +690,19 @@ impl<'a> HelloTriangleApplication<'a> {
             &device,
             QueueWrapper::new(device, device_info.queue_indices.transfer),
         );
-        let vertex_buffer =
-            Self::create_vertex_buffer(&instance, &device_info, &vertices, &transfer_command_pool);
-        let index_buffer =
-            Self::create_index_buffer(&instance, &device_info, &indices, &transfer_command_pool);
+        let vertex_buffer = BufferWrapper::create_buffer_with_staging(
+            &device_info,
+            &vertices,
+            &transfer_command_pool,
+            BufferUsageFlags::VERTEX_BUFFER,
+        );
+        let index_buffer = BufferWrapper::create_buffer_with_staging(
+            &device_info,
+            &indices,
+            &transfer_command_pool,
+            BufferUsageFlags::INDEX_BUFFER,
+        );
+
         unsafe { transfer_command_pool.cleanup(device) };
 
         let swapchain_fns = Swapchain::new(&instance, &device);
@@ -543,10 +721,12 @@ impl<'a> HelloTriangleApplication<'a> {
 
         let queue_indices = &device_info.queue_indices;
 
-        let (pipeline, pipeline_layout) = Self::create_graphics_pipeline(&device, render_pass);
+        let descriptor_set_layout = Self::create_descriptor_layout(device);
+        let (pipeline, pipeline_layout) =
+            Self::create_graphics_pipeline(&device, render_pass, descriptor_set_layout);
 
         let graphics_command_pool = GraphicsCommandPool::new(
-            &device,
+            &device_info,
             QueueWrapper::new(device, device_info.queue_indices.graphics),
         );
         let present_queue = QueueWrapper::new(device, queue_indices.present);
@@ -570,6 +750,7 @@ impl<'a> HelloTriangleApplication<'a> {
 
             render_pass,
 
+            descriptor_set_layout,
             pipeline_layout,
             pipeline,
 
@@ -578,7 +759,7 @@ impl<'a> HelloTriangleApplication<'a> {
             graphics_command_pool,
             present_queue,
 
-            current_frame: 0,
+            start_time: std::time::Instant::now(),
 
             #[cfg(debug_assertions)]
             messenger,
@@ -606,9 +787,9 @@ impl<'a> HelloTriangleApplication<'a> {
 
         let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
             &self.device_info.device,
-            self.current_frame,
             acquire_image_index,
             |buffer, image_index| self.record_command_buffer(buffer, image_index),
+            |ub_map| self.update_uniform_buffer(ub_map),
         ) {
             Ok(i) => i,
             Err(Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -632,6 +813,40 @@ impl<'a> HelloTriangleApplication<'a> {
             Ok(false) => (),
             Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swap_chain(),
             _ => panic!("failed to present queue"),
+        }
+    }
+
+    fn update_uniform_buffer(&self, buffer_map: *mut UniformBufferObject) {
+        let elapsed = std::time::Instant::now()
+            .duration_since(self.start_time)
+            .as_micros();
+
+        let model = Rotation3::from_axis_angle(
+            &Vector3::z_axis(),
+            std::f32::consts::FRAC_PI_2 * (elapsed as f32 / 1e6),
+        )
+        .to_homogeneous();
+
+        let view = Isometry3::look_at_rh(
+            &Point3::new(2.0, 2.0, 2.0),
+            &Point3::origin(),
+            &Vector3::z_axis(),
+        )
+        .to_homogeneous();
+
+        let extent = self.swap_chain.extent;
+        let proj = Perspective3::new(
+            std::f32::consts::FRAC_PI_4,
+            extent.width as f32 / extent.height as f32,
+            0.1,
+            10.0,
+        )
+        .to_homogeneous();
+
+        let ubo = UniformBufferObject { model, view, proj };
+
+        unsafe {
+            (&ubo as *const UniformBufferObject).copy_to_nonoverlapping(buffer_map, 1);
         }
     }
 
@@ -775,11 +990,13 @@ impl<'a> HelloTriangleApplication<'a> {
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .expect("failed to create logical device!");
 
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
         DeviceInfo {
             device,
-            physical_device,
             queue_indices,
             swap_chain_support: swap_chain_support_details,
+            physical_memory_properties: mem_props,
         }
     }
 
@@ -1032,6 +1249,7 @@ impl<'a> HelloTriangleApplication<'a> {
     fn create_graphics_pipeline(
         device: &Device,
         render_pass: RenderPass,
+        descriptor_set_layout: DescriptorSetLayout,
     ) -> (Pipeline, PipelineLayout) {
         let vert_shader_module = Self::create_shader_module(device, include_shader!("vert.spv"));
         let vert_shader_stage_info = PipelineShaderStageCreateInfo {
@@ -1118,7 +1336,9 @@ impl<'a> HelloTriangleApplication<'a> {
             ..Default::default()
         };
 
-        let pipeline_layout_info = PipelineLayoutCreateInfo::default();
+        let descriptor_set_layouts = [descriptor_set_layout];
+        let pipeline_layout_info =
+            PipelineLayoutCreateInfo::builder().set_layouts(&descriptor_set_layouts);
 
         let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
             .expect("failed to create pipeline layout!");
@@ -1302,10 +1522,15 @@ impl<'a> HelloTriangleApplication<'a> {
             device.cmd_set_viewport(command_buffer, 0, &viewports);
             device.cmd_set_scissor(command_buffer, 0, &scissors);
 
-            let buffers = [self.vertex_buffer.0];
+            let buffers = [self.vertex_buffer.buffer];
             device.cmd_bind_vertex_buffers(command_buffer, 0, &buffers, &[0]);
 
-            device.cmd_bind_index_buffer(command_buffer, self.index_buffer.0, 0, IndexType::UINT16);
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffer.buffer,
+                0,
+                IndexType::UINT16,
+            );
 
             device.cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(command_buffer);
@@ -1371,18 +1596,10 @@ impl<'a> HelloTriangleApplication<'a> {
 
             self.device_info
                 .device
-                .free_memory(self.index_buffer.1, None);
-            self.device_info
-                .device
-                .destroy_buffer(self.index_buffer.0, None);
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-            self.device_info
-                .device
-                .free_memory(self.vertex_buffer.1, None);
-            self.device_info
-                .device
-                .destroy_buffer(self.vertex_buffer.0, None);
-
+            self.index_buffer.cleanup(&self.device_info.device);
+            self.vertex_buffer.cleanup(&self.device_info.device);
             self.graphics_command_pool.cleanup(&self.device_info.device);
 
             self.device_info
@@ -1413,145 +1630,22 @@ impl<'a> HelloTriangleApplication<'a> {
         }
     }
 
-    fn create_buffer(
-        device: &Device,
-        mem_props: &PhysicalDeviceMemoryProperties,
-        size: DeviceSize,
-        mem_prop_flags: MemoryPropertyFlags,
-        usage_flags: BufferUsageFlags,
-    ) -> (Buffer, DeviceMemory) {
-        let buffer_info = BufferCreateInfo::builder()
-            .size(size)
-            .usage(usage_flags)
-            .sharing_mode(SharingMode::EXCLUSIVE);
+    fn create_descriptor_layout(device: &Device) -> DescriptorSetLayout {
+        let ubo_layout_binding = DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(ShaderStageFlags::VERTEX);
 
-        let buffer =
-            unsafe { device.create_buffer(&buffer_info, None) }.expect("failed to create buffer");
-
-        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-        let find_memory_buffer = |type_filter: u32, props: MemoryPropertyFlags| -> u32 {
-            mem_props
-                .memory_types
-                .iter()
-                .take(mem_props.memory_type_count as usize)
-                .enumerate()
-                .filter(|(index, typ)| {
-                    (type_filter & (1 << index)) != 0 && typ.property_flags.contains(props)
-                })
-                .next()
-                .expect("failed to find suitable memory type")
-                .0 as u32
+        let bindings = [*ubo_layout_binding];
+        let layout_info = DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
+        let layout = unsafe {
+            device
+                .create_descriptor_set_layout(&layout_info, None)
+                .unwrap()
         };
 
-        let alloc_info = MemoryAllocateInfo::builder()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(find_memory_buffer(
-                mem_requirements.memory_type_bits,
-                mem_prop_flags,
-            ));
-
-        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-            .expect("failed to allocate vertex buffer memory");
-
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-            .expect("failed to bind buffer memory");
-
-        (buffer, memory)
-    }
-
-    fn create_index_buffer(
-        instance: &Instance,
-        device: &DeviceInfo,
-        indices: &[u16],
-        transfer_cmd_pool: &TransferCommandPool,
-    ) -> (Buffer, DeviceMemory) {
-        let mem_props =
-            unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
-        let size = std::mem::size_of_val(indices) as u64;
-
-        let (staging_buffer, staging_memory) = Self::create_buffer(
-            &device.device,
-            &mem_props,
-            size,
-            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
-            BufferUsageFlags::TRANSFER_SRC,
-        );
-
-        let data = unsafe {
-            device
-                .device
-                .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
-        }
-        .expect("failed to map memory");
-
-        unsafe { std::ptr::copy_nonoverlapping(indices.as_ptr(), data.cast(), indices.len()) };
-
-        unsafe { device.device.unmap_memory(staging_memory) };
-
-        let (index_buffer, index_memory) = Self::create_buffer(
-            &device.device,
-            &mem_props,
-            size,
-            MemoryPropertyFlags::DEVICE_LOCAL,
-            BufferUsageFlags::TRANSFER_DST | BufferUsageFlags::INDEX_BUFFER,
-        );
-
-        transfer_cmd_pool.copy_buffer(&device.device, staging_buffer, index_buffer, size);
-
-        unsafe {
-            device.device.destroy_buffer(staging_buffer, None);
-            device.device.free_memory(staging_memory, None);
-        }
-
-        (index_buffer, index_memory)
-    }
-
-    fn create_vertex_buffer(
-        instance: &Instance,
-        device: &DeviceInfo,
-        vertices: &[Vertex],
-        transfer_cmd_pool: &TransferCommandPool,
-    ) -> (Buffer, DeviceMemory) {
-        let mem_props =
-            unsafe { instance.get_physical_device_memory_properties(device.physical_device) };
-        let size = std::mem::size_of_val(vertices) as u64;
-
-        let (staging_buffer, staging_memory) = Self::create_buffer(
-            &device.device,
-            &mem_props,
-            size,
-            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
-            BufferUsageFlags::TRANSFER_SRC,
-        );
-
-        let data = unsafe {
-            device
-                .device
-                .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
-        }
-        .expect("failed to map memory");
-
-        unsafe { std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len()) };
-
-        unsafe { device.device.unmap_memory(staging_memory) };
-
-        let (vertex_buffer, vertex_memory) = Self::create_buffer(
-            &device.device,
-            &mem_props,
-            size,
-            MemoryPropertyFlags::DEVICE_LOCAL,
-            BufferUsageFlags::TRANSFER_DST | BufferUsageFlags::VERTEX_BUFFER,
-        );
-
-        transfer_cmd_pool.copy_buffer(&device.device, staging_buffer, vertex_buffer, size);
-
-        unsafe {
-            device.device.destroy_buffer(staging_buffer, None);
-            device.device.free_memory(staging_memory, None);
-        }
-
-        (vertex_buffer, vertex_memory)
+        layout
     }
 }
 
@@ -1568,9 +1662,20 @@ impl<'a> Drop for HelloTriangleApplication<'a> {
 }
 
 #[derive(Debug)]
+#[repr(transparent)]
+struct Color([f32; 3]);
+
+#[derive(Debug)]
 struct Vertex {
-    pos: glm::Vec2,
-    color: glm::Vec3,
+    pos: Point2<f32>,
+    color: Color,
+}
+
+#[derive(Debug)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    proj: Matrix4<f32>,
 }
 
 impl Vertex {
