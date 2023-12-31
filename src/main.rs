@@ -370,14 +370,14 @@ impl BufferWrapper {
             BufferUsageFlags::TRANSFER_SRC,
         );
 
-        let data = unsafe {
+        let map_ptr = unsafe {
             device
                 .device
                 .map_memory(staging_memory, 0, size, MemoryMapFlags::empty())
         }
         .expect("failed to map memory");
 
-        unsafe { std::ptr::copy_nonoverlapping(data as *const _, data.cast(), 1) };
+        unsafe { std::ptr::copy_nonoverlapping(data, map_ptr.cast(), 1) };
 
         unsafe { device.device.unmap_memory(staging_memory) };
 
@@ -429,22 +429,23 @@ struct InFlightBuffers {
     command_buffer: CommandBuffer,
     uniform_buffer: BufferWrapper,
     ub_map: *mut UniformBufferObject,
+    descriptor_set: DescriptorSet,
 }
 
 impl InFlightBuffers {
     fn new(
         device: &DeviceInfo,
         command_buffer: CommandBuffer,
-        uniform_buffer_size: DeviceSize,
+        descriptor_set: DescriptorSet,
+        (uniform_buffer, ub_map): (BufferWrapper, *mut c_void),
     ) -> Self {
         let sync_objects = Self::create_sync_objects(&device.device);
-        let (uniform_buffer, ub_map) =
-            BufferWrapper::create_mapped_buffer(device, uniform_buffer_size);
 
         Self {
             command_buffer,
             sync_objects,
             uniform_buffer,
+            descriptor_set,
             ub_map: ub_map.cast(),
         }
     }
@@ -491,6 +492,7 @@ impl InFlightBuffers {
 }
 
 struct GraphicsCommandPool {
+    descriptor_pool: DescriptorPool,
     command_pool: CommandPool,
 
     in_flight_buffers: [InFlightBuffers; MAX_FRAMES_IN_FLIGHT],
@@ -500,33 +502,110 @@ struct GraphicsCommandPool {
 }
 
 impl GraphicsCommandPool {
-    fn new(device: &DeviceInfo, queue: QueueWrapper) -> Self {
-        let pool_info = CommandPoolCreateInfo {
+    fn new(
+        device: &DeviceInfo,
+        queue: QueueWrapper,
+        descriptor_set_layout: DescriptorSetLayout,
+    ) -> Self {
+        let cmd_pool_info = CommandPoolCreateInfo {
             flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             queue_family_index: queue.index,
 
             ..Default::default()
         };
-
-        let command_pool = unsafe { device.device.create_command_pool(&pool_info, None) }
+        let command_pool = unsafe { device.device.create_command_pool(&cmd_pool_info, None) }
             .expect("failed to create command pool");
 
         let command_buffers = Self::create_command_buffers(&device.device, command_pool);
+        let uniform_buffers: Vec<_> = command_buffers
+            .iter()
+            .map(|_| {
+                BufferWrapper::create_mapped_buffer(
+                    device,
+                    std::mem::size_of::<UniformBufferObject>() as DeviceSize,
+                )
+            })
+            .collect();
 
-        let in_flight_buffers = command_buffers.map(|cmd_buffer| {
-            InFlightBuffers::new(
-                device,
-                cmd_buffer,
-                std::mem::size_of::<UniformBufferObject>() as DeviceSize,
-            )
-        });
+        let descriptor_pool = Self::create_descriptor_pool(&device.device);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device.device,
+            descriptor_pool,
+            descriptor_set_layout,
+            uniform_buffers.iter().map(|buf| &buf.0),
+        );
+        let in_flight_buffers = unsafe {
+            command_buffers
+                .into_iter()
+                .zip(uniform_buffers.into_iter())
+                .zip(descriptor_sets.into_iter())
+                .map(|((cmd_buffer, uniform_buffer), descriptor_set)| {
+                    InFlightBuffers::new(device, cmd_buffer, descriptor_set, uniform_buffer)
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_unchecked()
+        };
 
         Self {
+            descriptor_pool,
             command_pool,
             queue,
             current_frame: RefCell::new(0),
             in_flight_buffers,
         }
+    }
+
+    fn create_descriptor_pool(device: &Device) -> DescriptorPool {
+        let pool_sizes = [DescriptorPoolSize {
+            ty: DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+        }];
+        let create_info = DescriptorPoolCreateInfo::builder()
+            .pool_sizes(&pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+
+        unsafe { device.create_descriptor_pool(&create_info, None) }.unwrap()
+    }
+
+    fn create_descriptor_sets<'a>(
+        device: &Device,
+        descriptor_pool: DescriptorPool,
+        set_layout: DescriptorSetLayout,
+        uniform_buffers: impl Iterator<Item = &'a BufferWrapper>,
+    ) -> [DescriptorSet; MAX_FRAMES_IN_FLIGHT] {
+        let layouts = [set_layout; MAX_FRAMES_IN_FLIGHT];
+        let alloc_info = DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+
+        let descriptor_sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }.unwrap();
+
+        let buffer_infos: Vec<_> = uniform_buffers
+            .map(|buf| {
+                [*DescriptorBufferInfo::builder()
+                    .buffer(buf.buffer)
+                    .offset(0)
+                    .range(std::mem::size_of::<UniformBufferObject>() as DeviceSize)]
+            })
+            .collect();
+
+        let descriptor_writes: Vec<_> = descriptor_sets
+            .iter()
+            .zip(buffer_infos.iter())
+            .map(|(&dst_set, buffer_info)| {
+                *WriteDescriptorSet::builder()
+                    .dst_set(dst_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(buffer_info)
+            })
+            .collect();
+
+        unsafe { device.update_descriptor_sets(&descriptor_writes, &[]) }
+
+        descriptor_sets.try_into().unwrap()
     }
 
     fn create_command_buffers(
@@ -550,7 +629,7 @@ impl GraphicsCommandPool {
         &self,
         device: &Device,
         acquire_next_image: impl FnOnce(Semaphore) -> std::result::Result<u32, Result>,
-        record_command_buffer: impl FnOnce(CommandBuffer, u32) -> (),
+        record_command_buffer: impl FnOnce(CommandBuffer, u32, &[DescriptorSet]) -> (),
         update_uniform_buffer: impl FnOnce(*mut UniformBufferObject) -> (),
     ) -> std::result::Result<(u32, [Semaphore; 1]), Result> {
         let mut current_frame = self.current_frame.borrow_mut();
@@ -563,6 +642,7 @@ impl GraphicsCommandPool {
                 },
             command_buffer,
             ub_map,
+            descriptor_set,
             ..
         } = self.in_flight_buffers[*current_frame];
 
@@ -586,7 +666,7 @@ impl GraphicsCommandPool {
                 .expect("failed to reset command buffer");
         }
 
-        record_command_buffer(command_buffer, image_index);
+        record_command_buffer(command_buffer, image_index, &[descriptor_set]);
         update_uniform_buffer(ub_map);
 
         let wait_semaphores = [img_available];
@@ -615,6 +695,7 @@ impl GraphicsCommandPool {
         self.in_flight_buffers
             .iter_mut()
             .for_each(|buf| buf.cleanup(device));
+        device.destroy_descriptor_pool(self.descriptor_pool, None);
         device.destroy_command_pool(self.command_pool, None);
     }
 }
@@ -728,6 +809,7 @@ impl<'a> HelloTriangleApplication<'a> {
         let graphics_command_pool = GraphicsCommandPool::new(
             &device_info,
             QueueWrapper::new(device, device_info.queue_indices.graphics),
+            descriptor_set_layout,
         );
         let present_queue = QueueWrapper::new(device, queue_indices.present);
 
@@ -788,7 +870,9 @@ impl<'a> HelloTriangleApplication<'a> {
         let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
             &self.device_info.device,
             acquire_image_index,
-            |buffer, image_index| self.record_command_buffer(buffer, image_index),
+            |buffer, image_index, dst_sets| {
+                self.record_command_buffer(buffer, image_index, dst_sets)
+            },
             |ub_map| self.update_uniform_buffer(ub_map),
         ) {
             Ok(i) => i,
@@ -824,26 +908,26 @@ impl<'a> HelloTriangleApplication<'a> {
         let model = Rotation3::from_axis_angle(
             &Vector3::z_axis(),
             std::f32::consts::FRAC_PI_2 * (elapsed as f32 / 1e6),
-        )
-        .to_homogeneous();
+        );
 
         let view = Isometry3::look_at_rh(
             &Point3::new(2.0, 2.0, 2.0),
             &Point3::origin(),
             &Vector3::z_axis(),
-        )
-        .to_homogeneous();
+        );
 
-        let extent = self.swap_chain.extent;
+        let aspect_ratio = {
+            let extent = self.swap_chain.extent;
+            extent.width as f32 / extent.height as f32
+        };
         let proj = Perspective3::new(
-            std::f32::consts::FRAC_PI_4,
-            extent.width as f32 / extent.height as f32,
+            std::f32::consts::FRAC_PI_4 * aspect_ratio,
+            aspect_ratio,
             0.1,
             10.0,
-        )
-        .to_homogeneous();
+        );
 
-        let ubo = UniformBufferObject { model, view, proj };
+        let ubo = UniformBufferObject::new(nalgebra::convert(model), view, proj);
 
         unsafe {
             (&ubo as *const UniformBufferObject).copy_to_nonoverlapping(buffer_map, 1);
@@ -1306,7 +1390,7 @@ impl<'a> HelloTriangleApplication<'a> {
             line_width: 1.0,
 
             cull_mode: CullModeFlags::BACK,
-            front_face: FrontFace::CLOCKWISE,
+            front_face: FrontFace::COUNTER_CLOCKWISE,
 
             depth_bias_enable: FALSE,
 
@@ -1469,7 +1553,12 @@ impl<'a> HelloTriangleApplication<'a> {
             .collect()
     }
 
-    fn record_command_buffer(&self, command_buffer: CommandBuffer, image_index: u32) {
+    fn record_command_buffer(
+        &self,
+        command_buffer: CommandBuffer,
+        image_index: u32,
+        descriptor_sets: &[DescriptorSet],
+    ) {
         let device = &self.device_info.device;
         let begin_info = CommandBufferBeginInfo::default();
 
@@ -1530,6 +1619,15 @@ impl<'a> HelloTriangleApplication<'a> {
                 self.index_buffer.buffer,
                 0,
                 IndexType::UINT16,
+            );
+
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                descriptor_sets,
+                &[],
             );
 
             device.cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
@@ -1672,10 +1770,30 @@ struct Vertex {
 }
 
 #[derive(Debug)]
+#[repr(align(16))]
+struct M4(Matrix4<f32>);
+
+#[derive(Debug)]
+#[repr(C)]
 struct UniformBufferObject {
-    model: Matrix4<f32>,
-    view: Matrix4<f32>,
-    proj: Matrix4<f32>,
+    _foo: Vector2<f32>,
+    model: M4,
+    view: M4,
+    proj: M4,
+}
+
+impl UniformBufferObject {
+    fn new(model: Similarity3<f32>, view: Isometry3<f32>, proj: Perspective3<f32>) -> Self {
+        let mut proj = proj.to_homogeneous();
+        proj[(1, 1)] *= -1.0;
+
+        Self {
+            _foo: Vector2::zeros(),
+            model: M4(model.to_homogeneous()),
+            view: M4(view.to_homogeneous()),
+            proj: M4(proj),
+        }
+    }
 }
 
 impl Vertex {
@@ -1707,12 +1825,21 @@ impl Vertex {
 
 fn main() {
     let event_loop = EventLoop::new().unwrap();
-    let window = Window::new(&event_loop).unwrap();
+    let window = std::sync::Arc::new(Window::new(&event_loop).unwrap());
     let entry = Entry::linked();
 
     let mut app = HelloTriangleApplication::new(&entry, &window);
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+
+    let win = std::sync::Arc::downgrade(&window);
+
+    std::thread::spawn(move || {
+        while let Some(window) = win.upgrade() {
+            window.request_redraw();
+            std::thread::sleep(std::time::Duration::from_secs_f64(1.0 / 60.0));
+        }
+    });
 
     event_loop
         .run(|event, elwt| match event {
@@ -1742,7 +1869,6 @@ fn main() {
                 event: WindowEvent::RedrawRequested,
                 ..
             } => {
-                println!("Redraw requested");
                 app.draw_frame();
             }
             _ => {
