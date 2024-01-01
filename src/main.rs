@@ -24,6 +24,9 @@ fn main() {
         }
     });
 
+    window
+        .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+        .unwrap();
     use winit::event::*;
     use winit::keyboard::*;
     event_loop
@@ -68,12 +71,11 @@ fn main() {
                     },
                 ..
             } => {
+                app.handle_key_event(event);
+
                 if event.state == ElementState::Pressed && !event.repeat {
                     use KeyCode::*;
                     match code {
-                        KeyD => {
-                            app.reversed = !app.reversed;
-                        }
                         Digit1 => {
                             FPS.store(10, Ordering::Relaxed);
                         }
@@ -89,7 +91,12 @@ fn main() {
                         _ => {}
                     }
                 }
-                //
+            }
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
+                app.handle_mouse_movement(delta);
             }
             _ => {
                 // println!("{event:?}");

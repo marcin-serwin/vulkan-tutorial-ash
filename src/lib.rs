@@ -1,3 +1,4 @@
+mod app_state;
 mod surface;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -11,6 +12,8 @@ use nalgebra::*;
 
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
+
+use app_state::AppState;
 
 macro_rules! include_shader {
     ($name:literal) => {
@@ -726,15 +729,13 @@ pub struct HelloTriangleApplication {
     pipeline_layout: PipelineLayout,
     pipeline: Pipeline,
 
-    pub reversed: bool,
-
     vertex_buffer: BufferWrapper,
     index_buffer: BufferWrapper,
 
     graphics_command_pool: GraphicsCommandPool,
     present_queue: QueueWrapper,
 
-    app_state: RefCell<(std::time::Instant, f32)>,
+    app_state: AppState,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -794,6 +795,11 @@ impl HelloTriangleApplication {
             descriptor_set_layout,
         );
         let present_queue = QueueWrapper::new(device, queue_indices.present);
+        let app_state = AppState::new(Isometry3::look_at_rh(
+            &Point3::new(2.0, 2.0, 2.0),
+            &Point3::origin(),
+            &Vector3::z_axis(),
+        ));
 
         Self {
             instance,
@@ -808,12 +814,11 @@ impl HelloTriangleApplication {
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
-            reversed: false,
 
             graphics_command_pool,
             present_queue,
 
-            app_state: RefCell::new((std::time::Instant::now(), 0.0)),
+            app_state,
 
             #[cfg(debug_assertions)]
             messenger,
@@ -832,6 +837,8 @@ impl HelloTriangleApplication {
         if self.occluded {
             return;
         }
+
+        self.app_state.update_app_state();
 
         let acquire_image_index = |img_available| self.swap_chain.acquire_next_image(img_available);
         let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
@@ -877,21 +884,9 @@ impl HelloTriangleApplication {
         buffer_map: *mut UniformBufferObject,
         swap_chain: &SwapChainData,
     ) {
-        let (ref mut previous_draw, ref mut rotated_angle) = *self.app_state.borrow_mut();
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(*previous_draw).as_micros();
-        *previous_draw = now;
-        *rotated_angle += std::f32::consts::FRAC_PI_2
-            * (elapsed as f32 / 1e6)
-            * (if self.reversed { -1.0 } else { 1.0 });
+        let model = Rotation3::from_axis_angle(&Vector3::z_axis(), self.app_state.model_rotation);
 
-        let model = Rotation3::from_axis_angle(&Vector3::z_axis(), *rotated_angle);
-
-        let view = Isometry3::look_at_rh(
-            &Point3::new(2.0, 2.0, 2.0),
-            &Point3::origin(),
-            &Vector3::z_axis(),
-        );
+        let view = self.app_state.get_view();
 
         let aspect_ratio = {
             let extent = swap_chain.extent;
@@ -1367,6 +1362,14 @@ impl HelloTriangleApplication {
         };
 
         layout
+    }
+
+    pub fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {
+        self.app_state.handle_key_event(event);
+    }
+
+    pub fn handle_mouse_movement(&mut self, delta: (f64, f64)) {
+        self.app_state.handle_mouse_movement(delta);
     }
 }
 
