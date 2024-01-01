@@ -3,11 +3,13 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::mem::ManuallyDrop;
+use surface::{SwapChain, SwapChainData, WindowSurface};
 
 use ash::extensions::ext::DebugUtils;
-use ash::{extensions::khr::*, vk::*, Device, Entry, Instance};
+use ash::{extensions::khr::Surface, vk::*, Device, Entry, Instance};
 use nalgebra::*;
 
+use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 macro_rules! include_shader {
@@ -168,13 +170,6 @@ impl Drop for Messenger {
 }
 
 #[derive(Debug, Default)]
-struct SwapChainSupportDetails {
-    capabilities: SurfaceCapabilitiesKHR,
-    formats: Vec<SurfaceFormatKHR>,
-    present_modes: Vec<PresentModeKHR>,
-}
-
-#[derive(Debug, Default)]
 struct PartialQueueFamilyIndices {
     graphics: Option<u32>,
     present: Option<u32>,
@@ -202,8 +197,8 @@ struct QueueFamilyIndices {
     transfer: u32,
 }
 
-struct QueueWrapper {
-    handle: Queue,
+pub struct QueueWrapper {
+    pub handle: Queue,
     index: u32,
 }
 impl QueueWrapper {
@@ -215,17 +210,17 @@ impl QueueWrapper {
     }
 }
 
-struct SwapChainData {
-    chain: SwapchainKHR,
-    images: Vec<Image>,
-    format: Format,
-    extent: Extent2D,
-}
-
 struct SyncObjects {
     image_available_semaphore: Semaphore,
     render_finished_semaphore: Semaphore,
     in_flight_fence: Fence,
+}
+
+#[derive(Debug, Default)]
+struct SwapChainSupportDetails {
+    capabilities: SurfaceCapabilitiesKHR,
+    formats: Vec<SurfaceFormatKHR>,
+    present_modes: Vec<PresentModeKHR>,
 }
 
 struct DeviceInfo {
@@ -233,6 +228,31 @@ struct DeviceInfo {
     swap_chain_support: SwapChainSupportDetails,
     queue_indices: QueueFamilyIndices,
     physical_memory_properties: PhysicalDeviceMemoryProperties,
+}
+
+impl DeviceInfo {
+    fn query_swap_chain_support(
+        entry: &Entry,
+        instance: &Instance,
+        device: PhysicalDevice,
+        surface: SurfaceKHR,
+    ) -> SwapChainSupportDetails {
+        let surface_fn = Surface::new(entry, instance);
+        let capabilities =
+            unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface) }
+                .unwrap_or_default();
+        let formats = unsafe { surface_fn.get_physical_device_surface_formats(device, surface) }
+            .unwrap_or_default();
+        let present_modes =
+            unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface) }
+                .unwrap_or_default();
+
+        SwapChainSupportDetails {
+            capabilities,
+            formats,
+            present_modes,
+        }
+    }
 }
 
 struct TransferCommandPool {
@@ -694,24 +714,18 @@ impl GraphicsCommandPool {
     }
 }
 
-pub struct HelloTriangleApplication<'a> {
-    entry: &'a Entry,
+pub struct HelloTriangleApplication {
     instance: Instance,
-    window: &'a Window,
-    surface: SurfaceKHR,
+    surface: WindowSurface,
     device_info: DeviceInfo,
-    swapchain_fns: Swapchain,
     pub occluded: bool,
 
-    swap_chain: SwapChainData,
-    image_views: Vec<ImageView>,
+    pub swap_chain: SwapChain,
 
-    render_pass: RenderPass,
     descriptor_set_layout: DescriptorSetLayout,
     pipeline_layout: PipelineLayout,
     pipeline: Pipeline,
 
-    framebuffers: Vec<Framebuffer>,
     pub reversed: bool,
 
     vertex_buffer: BufferWrapper,
@@ -726,8 +740,8 @@ pub struct HelloTriangleApplication<'a> {
     messenger: ManuallyDrop<Messenger>,
 }
 
-impl<'a> HelloTriangleApplication<'a> {
-    pub fn new(entry: &'a Entry, window: &'a Window) -> Self {
+impl HelloTriangleApplication {
+    pub fn new(entry: &Entry, window: &Window) -> Self {
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
@@ -736,8 +750,8 @@ impl<'a> HelloTriangleApplication<'a> {
         let instance = Self::create_instance(&entry);
         #[cfg(debug_assertions)]
         let messenger = ManuallyDrop::new(unsafe { Messenger::new(&entry, &instance) });
-        let surface = surface::create_surface(&entry, &instance, window);
-        let device_info = Self::create_logical_device(&entry, &instance, surface);
+        let surface = WindowSurface::new(&entry, &instance, window);
+        let device_info = Self::create_logical_device(&entry, &instance, &surface);
         let device = &device_info.device;
 
         let mut transfer_command_pool = TransferCommandPool::new(
@@ -759,25 +773,20 @@ impl<'a> HelloTriangleApplication<'a> {
 
         unsafe { transfer_command_pool.cleanup(device) };
 
-        let swapchain_fns = Swapchain::new(&instance, &device);
-        let swap_chain = Self::create_swap_chain(
-            &swapchain_fns,
+        let swap_chain = surface::SwapChain::new(
+            &instance,
+            device,
             window,
-            surface,
+            surface.handle,
             &device_info.swap_chain_support,
             &device_info.queue_indices,
         );
-        let image_views = Self::create_image_views(&device, &swap_chain);
-
-        let render_pass = Self::create_render_pass(&device, &swap_chain);
-        let framebuffers =
-            Self::create_framebuffers(&device, &swap_chain, &image_views, render_pass);
 
         let queue_indices = &device_info.queue_indices;
 
         let descriptor_set_layout = Self::create_descriptor_layout(device);
         let (pipeline, pipeline_layout) =
-            Self::create_graphics_pipeline(&device, render_pass, descriptor_set_layout);
+            Self::create_graphics_pipeline(&device, swap_chain.render_pass, descriptor_set_layout);
 
         let graphics_command_pool = GraphicsCommandPool::new(
             &device_info,
@@ -787,28 +796,19 @@ impl<'a> HelloTriangleApplication<'a> {
         let present_queue = QueueWrapper::new(device, queue_indices.present);
 
         Self {
-            entry,
             instance,
-            window,
             surface,
             device_info,
-            swapchain_fns,
             occluded,
 
+            swap_chain,
             vertex_buffer,
             index_buffer,
-
-            swap_chain,
-            image_views,
-
-            render_pass,
 
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
             reversed: false,
-
-            framebuffers,
 
             graphics_command_pool,
             present_queue,
@@ -820,59 +820,63 @@ impl<'a> HelloTriangleApplication<'a> {
         }
     }
 
+    pub fn window_resized(&mut self, size: PhysicalSize<u32>) {
+        self.swap_chain.recreate_swap_chain(
+            &self.device_info.device,
+            self.surface.handle,
+            Some(size),
+        );
+    }
+
     pub fn draw_frame(&mut self) {
         if self.occluded {
             return;
         }
 
-        let acquire_image_index = |img_available| match unsafe {
-            self.swapchain_fns.acquire_next_image(
-                self.swap_chain.chain,
-                u64::MAX,
-                img_available,
-                Fence::null(),
-            )
-        } {
-            Ok((index, _)) => Ok(index),
-            Err(err @ Result::ERROR_OUT_OF_DATE_KHR) => Err(err),
-
-            _ => panic!("failed to acquire next image from swap chain"),
-        };
-
+        let acquire_image_index = |img_available| self.swap_chain.acquire_next_image(img_available);
         let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
             &self.device_info.device,
             acquire_image_index,
             |buffer, image_index, dst_sets| {
                 self.record_command_buffer(buffer, image_index, dst_sets)
             },
-            |ub_map| self.update_uniform_buffer(ub_map),
+            |ub_map| self.update_uniform_buffer(ub_map, &self.swap_chain.data),
         ) {
             Ok(i) => i,
             Err(Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_swap_chain();
+                self.swap_chain.recreate_swap_chain(
+                    &self.device_info.device,
+                    self.surface.handle,
+                    None,
+                );
                 return;
             }
             _ => panic!("failed to draw frame"),
         };
 
-        let swapchains = [self.swap_chain.chain];
+        let swapchains = [self.swap_chain.data.chain];
         let image_indices = [image_index];
         let present_info = PresentInfoKHR::builder()
             .wait_semaphores(&signal_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        match unsafe {
-            self.swapchain_fns
-                .queue_present(self.present_queue.handle, &present_info)
-        } {
+        match { self.swap_chain.present(&self.present_queue, &present_info) } {
             Ok(false) => (),
-            Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swap_chain(),
+            Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.swap_chain.recreate_swap_chain(
+                &self.device_info.device,
+                self.surface.handle,
+                None,
+            ),
             _ => panic!("failed to present queue"),
         }
     }
 
-    fn update_uniform_buffer(&self, buffer_map: *mut UniformBufferObject) {
+    fn update_uniform_buffer(
+        &self,
+        buffer_map: *mut UniformBufferObject,
+        swap_chain: &SwapChainData,
+    ) {
         let (ref mut previous_draw, ref mut rotated_angle) = *self.app_state.borrow_mut();
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(*previous_draw).as_micros();
@@ -890,7 +894,7 @@ impl<'a> HelloTriangleApplication<'a> {
         );
 
         let aspect_ratio = {
-            let extent = self.swap_chain.extent;
+            let extent = swap_chain.extent;
             extent.width as f32 / extent.height as f32
         };
 
@@ -948,10 +952,10 @@ impl<'a> HelloTriangleApplication<'a> {
     fn create_logical_device(
         entry: &Entry,
         instance: &Instance,
-        surface: SurfaceKHR,
+        surface: &WindowSurface,
     ) -> DeviceInfo {
         let (physical_device, queue_indices, swap_chain_support_details) =
-            Self::pick_physical_device(entry, instance, surface);
+            Self::pick_physical_device(entry, instance, surface.handle);
 
         let unique_indices = {
             let mut set = HashSet::new();
@@ -1042,7 +1046,7 @@ impl<'a> HelloTriangleApplication<'a> {
             }
 
             let swap_chain_support =
-                Self::query_swap_chain_support(entry, instance, device, surface);
+                DeviceInfo::query_swap_chain_support(entry, instance, device, surface);
             if swap_chain_support.formats.is_empty() || swap_chain_support.present_modes.is_empty()
             {
                 return None;
@@ -1075,168 +1079,6 @@ impl<'a> HelloTriangleApplication<'a> {
             .collect();
 
         DEVICE_EXTENSIONS.into_iter().all(|ext| exts.contains(&ext))
-    }
-
-    fn query_swap_chain_support(
-        entry: &Entry,
-        instance: &Instance,
-        device: PhysicalDevice,
-        surface: SurfaceKHR,
-    ) -> SwapChainSupportDetails {
-        let surface_fn = Surface::new(entry, instance);
-        let capabilities =
-            unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface) }
-                .unwrap_or_default();
-        let formats = unsafe { surface_fn.get_physical_device_surface_formats(device, surface) }
-            .unwrap_or_default();
-        let present_modes =
-            unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface) }
-                .unwrap_or_default();
-
-        SwapChainSupportDetails {
-            capabilities,
-            formats,
-            present_modes,
-        }
-    }
-
-    fn create_swap_chain(
-        swapchain: &Swapchain,
-        window: &Window,
-        surface: SurfaceKHR,
-        swap_chain_support: &SwapChainSupportDetails,
-        queue_family_indices: &QueueFamilyIndices,
-    ) -> SwapChainData {
-        let surface_format = Self::choose_swap_surface_format(&swap_chain_support.formats);
-        let present_mode = Self::choose_swap_present_mode(&swap_chain_support.present_modes);
-        let extent = Self::choose_swap_extent(window, &swap_chain_support.capabilities);
-
-        let image_count = (swap_chain_support.capabilities.min_image_count + 1).clamp(
-            swap_chain_support.capabilities.min_image_count,
-            if swap_chain_support.capabilities.max_image_count == 0 {
-                u32::MAX
-            } else {
-                swap_chain_support.capabilities.max_image_count
-            },
-        );
-
-        let queue_indices = [queue_family_indices.graphics, queue_family_indices.present];
-
-        let queue_indices: &[u32] = if queue_family_indices.graphics == queue_family_indices.present
-        {
-            &[]
-        } else {
-            &queue_indices
-        };
-
-        let create_info = SwapchainCreateInfoKHR {
-            surface,
-            min_image_count: image_count,
-            image_format: surface_format.format,
-            image_color_space: surface_format.color_space,
-            image_extent: extent,
-
-            image_array_layers: 1,
-            image_usage: ImageUsageFlags::COLOR_ATTACHMENT,
-
-            image_sharing_mode: if queue_indices.is_empty() {
-                SharingMode::EXCLUSIVE
-            } else {
-                SharingMode::CONCURRENT
-            },
-            queue_family_index_count: queue_indices.len() as u32,
-            p_queue_family_indices: queue_indices.as_ptr(),
-
-            pre_transform: swap_chain_support.capabilities.current_transform,
-            composite_alpha: CompositeAlphaFlagsKHR::OPAQUE,
-            present_mode,
-            clipped: TRUE,
-            old_swapchain: SwapchainKHR::null(),
-            ..Default::default()
-        };
-
-        let swap_chain = unsafe { swapchain.create_swapchain(&create_info, None) }
-            .expect("failed to create swapchain");
-
-        let images = unsafe { swapchain.get_swapchain_images(swap_chain) }
-            .expect("failed to get swapchain images");
-
-        SwapChainData {
-            chain: swap_chain,
-            format: surface_format.format,
-            extent,
-            images,
-        }
-    }
-
-    fn choose_swap_surface_format(available_formats: &Vec<SurfaceFormatKHR>) -> SurfaceFormatKHR {
-        *available_formats
-            .iter()
-            .find(|format| {
-                format.format == Format::B8G8R8A8_SRGB
-                    && format.color_space == ColorSpaceKHR::SRGB_NONLINEAR
-            })
-            .unwrap_or(&available_formats[0])
-    }
-
-    fn choose_swap_present_mode(available_modes: &Vec<PresentModeKHR>) -> PresentModeKHR {
-        *available_modes
-            .iter()
-            .find(|&&mode| mode == PresentModeKHR::MAILBOX)
-            .unwrap_or(&PresentModeKHR::FIFO)
-    }
-
-    fn choose_swap_extent(window: &Window, capabilities: &SurfaceCapabilitiesKHR) -> Extent2D {
-        if capabilities.current_extent.width != u32::MAX {
-            return capabilities.current_extent;
-        } else {
-            let size = window.inner_size();
-
-            Extent2D {
-                width: size.width.clamp(
-                    capabilities.min_image_extent.width,
-                    capabilities.max_image_extent.width,
-                ),
-                height: size.height.clamp(
-                    capabilities.min_image_extent.height,
-                    capabilities.max_image_extent.height,
-                ),
-            }
-        }
-    }
-
-    fn create_image_views(device: &Device, swap_chain_data: &SwapChainData) -> Vec<ImageView> {
-        swap_chain_data
-            .images
-            .iter()
-            .map(|&img| {
-                let create_info = ImageViewCreateInfo {
-                    image: img,
-                    view_type: ImageViewType::TYPE_2D,
-                    format: swap_chain_data.format,
-
-                    components: ComponentMapping {
-                        r: ComponentSwizzle::IDENTITY,
-                        g: ComponentSwizzle::IDENTITY,
-                        b: ComponentSwizzle::IDENTITY,
-                        a: ComponentSwizzle::IDENTITY,
-                    },
-
-                    subresource_range: ImageSubresourceRange {
-                        aspect_mask: ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-
-                    ..Default::default()
-                };
-
-                unsafe { device.create_image_view(&create_info, None) }
-                    .expect("failed to create image view")
-            })
-            .collect()
     }
 
     fn create_graphics_pipeline(
@@ -1381,87 +1223,6 @@ impl<'a> HelloTriangleApplication<'a> {
             .expect("failed to create shader module")
     }
 
-    fn create_render_pass(device: &Device, swap_chain_data: &SwapChainData) -> RenderPass {
-        let color_attachments = [AttachmentDescription {
-            format: swap_chain_data.format,
-            samples: SampleCountFlags::TYPE_1,
-
-            load_op: AttachmentLoadOp::CLEAR,
-            store_op: AttachmentStoreOp::STORE,
-
-            stencil_load_op: AttachmentLoadOp::DONT_CARE,
-            stencil_store_op: AttachmentStoreOp::DONT_CARE,
-
-            initial_layout: ImageLayout::UNDEFINED,
-            final_layout: ImageLayout::PRESENT_SRC_KHR,
-
-            ..Default::default()
-        }];
-
-        let color_attachment_refs = [AttachmentReference {
-            attachment: 0,
-            layout: ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        }];
-
-        let subpasses = [SubpassDescription {
-            pipeline_bind_point: PipelineBindPoint::GRAPHICS,
-            color_attachment_count: color_attachment_refs.len() as u32,
-            p_color_attachments: color_attachment_refs.as_ptr(),
-
-            ..Default::default()
-        }];
-
-        let dependencies = [SubpassDependency {
-            src_subpass: SUBPASS_EXTERNAL,
-            dst_subpass: 0,
-
-            src_stage_mask: PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            src_access_mask: AccessFlags::empty(),
-
-            dst_stage_mask: PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            dst_access_mask: AccessFlags::COLOR_ATTACHMENT_WRITE,
-
-            ..Default::default()
-        }];
-
-        let render_pass_info = RenderPassCreateInfo::builder()
-            .attachments(&color_attachments)
-            .subpasses(&subpasses)
-            .dependencies(&dependencies);
-
-        unsafe { device.create_render_pass(&render_pass_info, None) }
-            .expect("failed to create render pass!")
-    }
-
-    fn create_framebuffers(
-        device: &Device,
-        swap_chain_data: &SwapChainData,
-        image_views: &Vec<ImageView>,
-        render_pass: RenderPass,
-    ) -> Vec<Framebuffer> {
-        image_views
-            .iter()
-            .map(|&img_view| {
-                let attachments = [img_view];
-
-                let framebuffer_info = FramebufferCreateInfo {
-                    render_pass,
-                    attachment_count: attachments.len() as u32,
-                    p_attachments: attachments.as_ptr(),
-
-                    width: swap_chain_data.extent.width,
-                    height: swap_chain_data.extent.height,
-                    layers: 1,
-
-                    ..Default::default()
-                };
-
-                unsafe { device.create_framebuffer(&framebuffer_info, None) }
-                    .expect("failed to create framebuffer!")
-            })
-            .collect()
-    }
-
     fn record_command_buffer(
         &self,
         command_buffer: CommandBuffer,
@@ -1481,11 +1242,11 @@ impl<'a> HelloTriangleApplication<'a> {
         }];
 
         let render_pass_info = RenderPassBeginInfo {
-            render_pass: self.render_pass,
-            framebuffer: self.framebuffers[image_index as usize],
+            render_pass: self.swap_chain.render_pass,
+            framebuffer: self.swap_chain.framebuffers[image_index as usize],
             render_area: Rect2D {
                 offset: Offset2D { x: 0, y: 0 },
-                extent: self.swap_chain.extent,
+                extent: self.swap_chain.data.extent,
             },
 
             clear_value_count: clear_colors.len() as u32,
@@ -1497,15 +1258,15 @@ impl<'a> HelloTriangleApplication<'a> {
         let viewports = [Viewport {
             x: 0.0,
             y: 0.0,
-            width: self.swap_chain.extent.width as f32,
-            height: self.swap_chain.extent.height as f32,
+            width: self.swap_chain.data.extent.width as f32,
+            height: self.swap_chain.data.extent.height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
 
         let scissors = [Rect2D {
             offset: Offset2D { x: 0, y: 0 },
-            extent: self.swap_chain.extent,
+            extent: self.swap_chain.data.extent,
         }];
 
         unsafe {
@@ -1548,58 +1309,11 @@ impl<'a> HelloTriangleApplication<'a> {
         }
     }
 
-    unsafe fn cleanup_swap_chain(&mut self) {
-        self.framebuffers
-            .iter()
-            .for_each(|&fbuf| self.device_info.device.destroy_framebuffer(fbuf, None));
-
-        self.device_info
-            .device
-            .destroy_render_pass(self.render_pass, None);
-
-        self.image_views
-            .iter()
-            .for_each(|&img_view| self.device_info.device.destroy_image_view(img_view, None));
-
-        self.swapchain_fns
-            .destroy_swapchain(self.swap_chain.chain, None);
-    }
-
-    pub fn recreate_swap_chain(&mut self) {
-        if self.occluded {
-            return;
-        }
-        unsafe {
-            self.device_info
-                .device
-                .device_wait_idle()
-                .expect("failed while waiting for device idle")
-        };
-
-        unsafe { self.cleanup_swap_chain() };
-
-        self.swap_chain = Self::create_swap_chain(
-            &self.swapchain_fns,
-            self.window,
-            self.surface,
-            &self.device_info.swap_chain_support,
-            &self.device_info.queue_indices,
-        );
-        self.image_views = Self::create_image_views(&self.device_info.device, &self.swap_chain);
-        self.render_pass = Self::create_render_pass(&self.device_info.device, &self.swap_chain);
-        self.framebuffers = Self::create_framebuffers(
-            &self.device_info.device,
-            &self.swap_chain,
-            &self.image_views,
-            self.render_pass,
-        );
-    }
-
     fn cleanup(&mut self) -> std::result::Result<(), Result> {
         unsafe {
             self.device_info.device.device_wait_idle()?;
 
-            self.cleanup_swap_chain();
+            self.swap_chain.cleanup_swap_chain(&self.device_info.device);
 
             self.device_info
                 .device
@@ -1616,8 +1330,8 @@ impl<'a> HelloTriangleApplication<'a> {
                 .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
 
+            self.surface.cleanup_surface();
             self.device_info.device.destroy_device(None);
-            Surface::new(&self.entry, &self.instance).destroy_surface(self.surface, None);
 
             #[cfg(debug_assertions)]
             ManuallyDrop::drop(&mut self.messenger);
@@ -1656,7 +1370,7 @@ impl<'a> HelloTriangleApplication<'a> {
     }
 }
 
-impl<'a> Drop for HelloTriangleApplication<'a> {
+impl Drop for HelloTriangleApplication {
     fn drop(&mut self) {
         if self.cleanup().is_err() {
             if std::thread::panicking() {

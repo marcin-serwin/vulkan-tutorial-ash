@@ -41,7 +41,7 @@ fn main() {
             } => {
                 // println!("Resized {size:?}");
                 app.occluded = size.width == 0 || size.height == 0;
-                app.recreate_swap_chain();
+                app.window_resized(size);
             }
             Event::WindowEvent {
                 event: WindowEvent::Occluded(is_occluded),
