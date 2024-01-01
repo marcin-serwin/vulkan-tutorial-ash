@@ -899,13 +899,8 @@ impl<'a> HelloTriangleApplication<'a> {
             extent.width as f32 / extent.height as f32
         };
 
-        let proj = Perspective3::new(
-            std::f32::consts::FRAC_PI_4 * aspect_ratio,
-            aspect_ratio,
-            0.1,
-            10.0,
-        )
-        .to_homogeneous();
+        let proj = Perspective3::new(aspect_ratio, std::f32::consts::FRAC_PI_4, 0.1, 10.0)
+            .to_homogeneous();
 
         let ubo = UniformBufferObject::new(nalgebra::convert(model), view, proj);
 
@@ -1370,7 +1365,7 @@ impl<'a> HelloTriangleApplication<'a> {
             line_width: 1.0,
 
             cull_mode: CullModeFlags::BACK,
-            front_face: FrontFace::CLOCKWISE,
+            front_face: FrontFace::COUNTER_CLOCKWISE,
 
             depth_bias_enable: FALSE,
 
@@ -1754,14 +1749,21 @@ struct UniformBufferObject {
 
 impl UniformBufferObject {
     fn new(model: Similarity3<f32>, view: Isometry3<f32>, proj: Matrix4<f32>) -> Self {
-        let rotate_y =
-            Rotation3::from_axis_angle(&Vector3::z_axis(), std::f32::consts::PI).to_homogeneous();
+        let flip_y = Similarity3::from_isometry(
+            nalgebra::convert(Rotation3::from_euler_angles(
+                std::f32::consts::PI,
+                0.0,
+                std::f32::consts::PI,
+            )),
+            -1.0,
+        )
+        .to_homogeneous();
 
         Self {
             _foo: Vector2::zeros(),
             model: M4(model.to_homogeneous()),
             view: M4(view.to_homogeneous()),
-            proj: M4(rotate_y * proj),
+            proj: M4(flip_y * proj),
         }
     }
 }
