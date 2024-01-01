@@ -6,7 +6,7 @@ use std::mem::ManuallyDrop;
 use ash::extensions::ext::DebugUtils;
 use ash::{extensions::khr::*, vk::*, Device, Entry, Instance};
 use nalgebra::*;
-use winit::event::{Event, WindowEvent};
+
 use winit::event_loop::EventLoop;
 #[cfg(target_os = "macos")]
 use winit::raw_window_handle::AppKitWindowHandle;
@@ -353,7 +353,7 @@ impl BufferWrapper {
 
     fn create_buffer_with_staging<T>(
         device: &DeviceInfo,
-        data: &T,
+        data: &[T],
         transfer_cmd_pool: &TransferCommandPool,
         usage: BufferUsageFlags,
     ) -> BufferWrapper {
@@ -377,7 +377,7 @@ impl BufferWrapper {
         }
         .expect("failed to map memory");
 
-        unsafe { std::ptr::copy_nonoverlapping(data, map_ptr.cast(), 1) };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), map_ptr.cast(), data.len()) };
 
         unsafe { device.device.unmap_memory(staging_memory) };
 
@@ -718,8 +718,7 @@ struct HelloTriangleApplication<'a> {
     pipeline: Pipeline,
 
     framebuffers: Vec<Framebuffer>,
-    vertices: [Vertex; 4],
-    indices: [u16; 6],
+    reversed: bool,
 
     vertex_buffer: BufferWrapper,
     index_buffer: BufferWrapper,
@@ -727,7 +726,7 @@ struct HelloTriangleApplication<'a> {
     graphics_command_pool: GraphicsCommandPool,
     present_queue: QueueWrapper,
 
-    start_time: std::time::Instant,
+    app_state: RefCell<(std::time::Instant, f32)>,
 
     #[cfg(debug_assertions)]
     messenger: ManuallyDrop<Messenger>,
@@ -735,26 +734,6 @@ struct HelloTriangleApplication<'a> {
 
 impl<'a> HelloTriangleApplication<'a> {
     fn new(entry: &'a Entry, window: &'a Window) -> Self {
-        let vertices = [
-            Vertex {
-                pos: Point2::new(-0.5, -0.5),
-                color: Color([1.0, 0.0, 0.0]),
-            },
-            Vertex {
-                pos: Point2::new(0.5, -0.5),
-                color: Color([0.0, 1.0, 0.0]),
-            },
-            Vertex {
-                pos: Point2::new(0.5, 0.5),
-                color: Color([0.0, 0.0, 1.0]),
-            },
-            Vertex {
-                pos: Point2::new(-0.5, 0.5),
-                color: Color([1.0, 1.0, 1.0]),
-            },
-        ];
-        let indices = [0, 1, 2, 2, 3, 0];
-
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
@@ -773,13 +752,13 @@ impl<'a> HelloTriangleApplication<'a> {
         );
         let vertex_buffer = BufferWrapper::create_buffer_with_staging(
             &device_info,
-            &vertices,
+            VERTICES,
             &transfer_command_pool,
             BufferUsageFlags::VERTEX_BUFFER,
         );
         let index_buffer = BufferWrapper::create_buffer_with_staging(
             &device_info,
-            &indices,
+            INDICES,
             &transfer_command_pool,
             BufferUsageFlags::INDEX_BUFFER,
         );
@@ -822,8 +801,6 @@ impl<'a> HelloTriangleApplication<'a> {
             swapchain_fns,
             occluded,
 
-            vertices,
-            indices,
             vertex_buffer,
             index_buffer,
 
@@ -835,13 +812,14 @@ impl<'a> HelloTriangleApplication<'a> {
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
+            reversed: false,
 
             framebuffers,
 
             graphics_command_pool,
             present_queue,
 
-            start_time: std::time::Instant::now(),
+            app_state: RefCell::new((std::time::Instant::now(), 0.0)),
 
             #[cfg(debug_assertions)]
             messenger,
@@ -901,14 +879,15 @@ impl<'a> HelloTriangleApplication<'a> {
     }
 
     fn update_uniform_buffer(&self, buffer_map: *mut UniformBufferObject) {
-        let elapsed = std::time::Instant::now()
-            .duration_since(self.start_time)
-            .as_micros();
+        let (ref mut previous_draw, ref mut rotated_angle) = *self.app_state.borrow_mut();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(*previous_draw).as_micros();
+        *previous_draw = now;
+        *rotated_angle += std::f32::consts::FRAC_PI_2
+            * (elapsed as f32 / 1e6)
+            * (if self.reversed { -1.0 } else { 1.0 });
 
-        let model = Rotation3::from_axis_angle(
-            &Vector3::z_axis(),
-            std::f32::consts::FRAC_PI_2 * (elapsed as f32 / 1e6),
-        );
+        let model = Rotation3::from_axis_angle(&Vector3::z_axis(), *rotated_angle);
 
         let view = Isometry3::look_at_rh(
             &Point3::new(2.0, 2.0, 2.0),
@@ -920,12 +899,14 @@ impl<'a> HelloTriangleApplication<'a> {
             let extent = self.swap_chain.extent;
             extent.width as f32 / extent.height as f32
         };
+
         let proj = Perspective3::new(
             std::f32::consts::FRAC_PI_4 * aspect_ratio,
             aspect_ratio,
             0.1,
             10.0,
-        );
+        )
+        .to_homogeneous();
 
         let ubo = UniformBufferObject::new(nalgebra::convert(model), view, proj);
 
@@ -1390,7 +1371,7 @@ impl<'a> HelloTriangleApplication<'a> {
             line_width: 1.0,
 
             cull_mode: CullModeFlags::BACK,
-            front_face: FrontFace::COUNTER_CLOCKWISE,
+            front_face: FrontFace::CLOCKWISE,
 
             depth_bias_enable: FALSE,
 
@@ -1630,7 +1611,7 @@ impl<'a> HelloTriangleApplication<'a> {
                 &[],
             );
 
-            device.cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
+            device.cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(command_buffer);
 
             device
@@ -1760,16 +1741,6 @@ impl<'a> Drop for HelloTriangleApplication<'a> {
 }
 
 #[derive(Debug)]
-#[repr(transparent)]
-struct Color([f32; 3]);
-
-#[derive(Debug)]
-struct Vertex {
-    pos: Point2<f32>,
-    color: Color,
-}
-
-#[derive(Debug)]
 #[repr(align(16))]
 struct M4(Matrix4<f32>);
 
@@ -1783,17 +1754,53 @@ struct UniformBufferObject {
 }
 
 impl UniformBufferObject {
-    fn new(model: Similarity3<f32>, view: Isometry3<f32>, proj: Perspective3<f32>) -> Self {
-        let mut proj = proj.to_homogeneous();
-        proj[(1, 1)] *= -1.0;
+    fn new(model: Similarity3<f32>, view: Isometry3<f32>, proj: Matrix4<f32>) -> Self {
+        let rotate_y =
+            Rotation3::from_axis_angle(&Vector3::z_axis(), std::f32::consts::PI).to_homogeneous();
 
         Self {
             _foo: Vector2::zeros(),
             model: M4(model.to_homogeneous()),
             view: M4(view.to_homogeneous()),
-            proj: M4(proj),
+            proj: M4(rotate_y * proj),
         }
     }
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        pos: Point3::new(-0.5, -0.5, 0.0),
+        color: Color::RED,
+    },
+    Vertex {
+        pos: Point3::new(0.5, -0.5, 0.0),
+        color: Color::GREEN,
+    },
+    Vertex {
+        pos: Point3::new(0.5, 0.5, 0.0),
+        color: Color::BLUE,
+    },
+    Vertex {
+        pos: Point3::new(-0.5, 0.5, 0.0),
+        color: Color::WHITE,
+    },
+];
+const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
+
+#[derive(Debug)]
+#[repr(transparent)]
+struct Color([f32; 3]);
+impl Color {
+    const RED: Color = Color([1.0, 0.0, 0.0]);
+    const GREEN: Color = Color([0.0, 1.0, 0.0]);
+    const BLUE: Color = Color([0.0, 0.0, 1.0]);
+    const WHITE: Color = Color([1.0, 1.0, 1.0]);
+}
+
+#[derive(Debug)]
+struct Vertex {
+    pos: Point3<f32>,
+    color: Color,
 }
 
 impl Vertex {
@@ -1810,7 +1817,7 @@ impl Vertex {
             VertexInputAttributeDescription {
                 binding: 0,
                 location: 0,
-                format: Format::R32G32_SFLOAT,
+                format: Format::R32G32B32_SFLOAT,
                 offset: offset_of!(Vertex, pos) as u32,
             },
             VertexInputAttributeDescription {
@@ -1824,11 +1831,13 @@ impl Vertex {
 }
 
 fn main() {
+    use std::sync::{atomic::AtomicU8, atomic::Ordering};
     let event_loop = EventLoop::new().unwrap();
     let window = std::sync::Arc::new(Window::new(&event_loop).unwrap());
     let entry = Entry::linked();
 
     let mut app = HelloTriangleApplication::new(&entry, &window);
+    static FPS: AtomicU8 = AtomicU8::new(60);
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
@@ -1837,10 +1846,14 @@ fn main() {
     std::thread::spawn(move || {
         while let Some(window) = win.upgrade() {
             window.request_redraw();
-            std::thread::sleep(std::time::Duration::from_secs_f64(1.0 / 60.0));
+            std::thread::sleep(std::time::Duration::from_secs_f64(
+                1.0 / (FPS.load(Ordering::Relaxed) as f64),
+            ));
         }
     });
 
+    use winit::event::*;
+    use winit::keyboard::*;
     event_loop
         .run(|event, elwt| match event {
             Event::WindowEvent {
@@ -1854,7 +1867,7 @@ fn main() {
                 event: WindowEvent::Resized(size),
                 ..
             } => {
-                println!("Resized {size:?}");
+                // println!("Resized {size:?}");
                 app.occluded = size.width == 0 || size.height == 0;
                 app.recreate_swap_chain();
             }
@@ -1870,6 +1883,41 @@ fn main() {
                 ..
             } => {
                 app.draw_frame();
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::KeyboardInput {
+                        event:
+                            ref event @ KeyEvent {
+                                physical_key: PhysicalKey::Code(code),
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    use KeyCode::*;
+                    match code {
+                        KeyD => {
+                            app.reversed = !app.reversed;
+                        }
+                        Digit1 => {
+                            FPS.store(10, Ordering::Relaxed);
+                        }
+                        Digit2 => {
+                            FPS.store(30, Ordering::Relaxed);
+                        }
+                        Digit3 => {
+                            FPS.store(60, Ordering::Relaxed);
+                        }
+                        Digit4 => {
+                            FPS.store(144, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+                //
             }
             _ => {
                 // println!("{event:?}");
