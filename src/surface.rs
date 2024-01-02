@@ -2,35 +2,15 @@ use crate::QueueFamilyIndices;
 use crate::QueueWrapper;
 use crate::SwapChainSupportDetails;
 use crate::SwapchainCreateInfoKHR;
-use ash::extensions::khr::Surface;
-use ash::extensions::khr::Swapchain;
-use ash::vk::AccessFlags;
-use ash::vk::AttachmentDescription;
-use ash::vk::AttachmentLoadOp;
-use ash::vk::AttachmentReference;
-use ash::vk::AttachmentStoreOp;
-use ash::vk::ComponentMapping;
-use ash::vk::ComponentSwizzle;
-use ash::vk::Fence;
-use ash::vk::FramebufferCreateInfo;
-use ash::vk::ImageAspectFlags;
-use ash::vk::ImageLayout;
-use ash::vk::ImageSubresourceRange;
-use ash::vk::ImageViewCreateInfo;
-use ash::vk::ImageViewType;
-use ash::vk::PipelineBindPoint;
-use ash::vk::PipelineStageFlags;
-use ash::vk::PresentInfoKHR;
-use ash::vk::RenderPass;
-use ash::vk::RenderPassCreateInfo;
-use ash::vk::SampleCountFlags;
-use ash::vk::Semaphore;
-use ash::vk::SubpassDependency;
-use ash::vk::SubpassDescription;
+use ash::extensions::khr::{Surface, Swapchain};
 use ash::vk::{
-    self, ColorSpaceKHR, CompositeAlphaFlagsKHR, Extent2D, Format, Framebuffer, Image,
-    ImageUsageFlags, ImageView, PresentModeKHR, SharingMode, SurfaceCapabilitiesKHR,
-    SurfaceFormatKHR, SwapchainKHR,
+    self, AccessFlags, AttachmentDescription, AttachmentLoadOp, AttachmentReference,
+    AttachmentStoreOp, ColorSpaceKHR, ComponentMapping, ComponentSwizzle, CompositeAlphaFlagsKHR,
+    Extent2D, Fence, Format, Framebuffer, FramebufferCreateInfo, Image, ImageAspectFlags,
+    ImageLayout, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo,
+    ImageViewType, PipelineBindPoint, PipelineStageFlags, PresentInfoKHR, PresentModeKHR,
+    RenderPass, RenderPassCreateInfo, SampleCountFlags, Semaphore, SharingMode, SubpassDependency,
+    SubpassDescription, SurfaceCapabilitiesKHR, SurfaceFormatKHR, SwapchainKHR,
 };
 use ash::Device;
 use ash::{vk::SurfaceKHR, Entry, Instance};
@@ -83,7 +63,7 @@ impl WindowSurface {
         instance: &Instance,
         window_handle: AppKitWindowHandle,
     ) -> SurfaceKHR {
-        use ash::extensions::ext::MetalSurface;
+        use ash::{extensions::ext::MetalSurface, vk::MetalSurfaceCreateInfoEXT};
         use raw_window_metal::{appkit::metal_layer_from_handle, Layer::*};
         let surface = MetalSurface::new(&entry, &instance);
 

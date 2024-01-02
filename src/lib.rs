@@ -1007,7 +1007,7 @@ impl HelloTriangleApplication {
         for (index, queue) in props.into_iter().enumerate() {
             let index = index as u32;
             if queue.queue_flags.contains(QueueFlags::TRANSFER)
-                && !queue.queue_flags.contains(QueueFlags::GRAPHICS)
+                && (cfg!(target_os = "macos") || !queue.queue_flags.contains(QueueFlags::GRAPHICS))
             {
                 result.transfer = Some(index);
             }
