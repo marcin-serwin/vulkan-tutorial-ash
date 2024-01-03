@@ -15,9 +15,35 @@ use winit::window::Window;
 
 use app_state::AppState;
 
+#[macro_use]
+mod macros {
+    // based on https://users.rust-lang.org/t/can-i-conveniently-compile-bytes-into-a-rust-program-with-a-specific-alignment/24049/2
+    #[repr(C)] // guarantee 'bytes' comes after '_align'
+    pub struct AlignedAs<Align, Bytes: ?Sized> {
+        pub _align: [Align; 0],
+        pub bytes: Bytes,
+    }
+
+    macro_rules! include_bytes_as_array {
+        ($align_ty:ty, $path:expr) => {{
+            // const block expression to encapsulate the static
+            use $crate::macros::AlignedAs;
+            // this assignment is made possible by CoerceUnsized
+            static ALIGNED: &AlignedAs<$align_ty, [u8]> = &AlignedAs {
+                _align: [],
+                bytes: *include_bytes!($path),
+            };
+
+            assert!(ALIGNED.bytes.len() % ::std::mem::size_of::<$align_ty>() == 0);
+
+            unsafe { &*(&ALIGNED.bytes as *const [u8] as *const [$align_ty]) }
+        }};
+    }
+}
+
 macro_rules! include_shader {
     ($name:literal) => {
-        include_bytes!(concat!(env!("OUT_DIR"), "/", $name))
+        include_bytes_as_array!(u32, concat!(env!("OUT_DIR"), "/", $name))
     };
 }
 
@@ -35,14 +61,14 @@ macro_rules! offset_of {
             let s = std::mem::MaybeUninit::<$ty>::uninit();
             let s_ptr = s.as_ptr();
             let f_ptr = unsafe { std::ptr::addr_of!((*s_ptr).$field) };
-            (unsafe { f_ptr.cast::<u8>().offset_from(s_ptr.cast::<u8>()) }) as usize
+            (unsafe { f_ptr.byte_offset_from(s_ptr) }) as usize
         };
         OFFSET
     }};
 }
 
 fn name_to_cstr(name: &[c_char]) -> &CStr {
-    CStr::from_bytes_until_nul(unsafe { std::mem::transmute(name) }).unwrap()
+    CStr::from_bytes_until_nul(unsafe { &*(name as *const [c_char] as *const [u8]) }).unwrap()
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -71,9 +97,10 @@ fn get_validation_layers(entry: &Entry) -> [&'static CStr; LAYERS.len()] {
         .map(|layer| name_to_cstr(&layer.layer_name))
         .collect();
 
-    if layers.iter().any(|ext| !names.contains(ext)) {
-        panic!("Required validation layer not found");
-    }
+    assert!(
+        !layers.iter().any(|ext| !names.contains(ext)),
+        "Required validation layer not found"
+    );
 
     layers
 }
@@ -105,9 +132,10 @@ fn get_extensions(entry: &Entry) -> [&'static CStr; EXTENSIONS.len()] {
         .map(|ext| name_to_cstr(&ext.extension_name))
         .collect();
 
-    if extensions.iter().any(|ext| !names.contains(ext)) {
-        panic!("Required extension not found");
-    }
+    assert!(
+        !extensions.iter().any(|ext| !names.contains(ext)),
+        "Required extension not found"
+    );
 
     extensions
 }
@@ -128,9 +156,10 @@ impl Messenger {
             .to_str()
             .expect("invalid message received from validation");
         eprintln!("{message_severity:?}: {message}");
-        if message_severity.contains(DebugUtilsMessageSeverityFlagsEXT::ERROR) {
-            panic!("Validation error");
-        }
+        assert!(
+            !message_severity.contains(DebugUtilsMessageSeverityFlagsEXT::ERROR),
+            "Validation error"
+        );
         FALSE
     }
 
@@ -344,10 +373,9 @@ impl BufferWrapper {
                 .iter()
                 .take(mem_props.memory_type_count as usize)
                 .enumerate()
-                .filter(|(index, typ)| {
+                .find(|(index, typ)| {
                     (type_filter & (1 << index)) != 0 && typ.property_flags.contains(props)
                 })
-                .next()
                 .expect("failed to find suitable memory type")
                 .0 as u32
         };
@@ -554,8 +582,8 @@ impl GraphicsCommandPool {
         let in_flight_buffers = unsafe {
             command_buffers
                 .into_iter()
-                .zip(uniform_buffers.into_iter())
-                .zip(descriptor_sets.into_iter())
+                .zip(uniform_buffers)
+                .zip(descriptor_sets)
                 .map(|((cmd_buffer, uniform_buffer), descriptor_set)| {
                     InFlightBuffers::new(device, cmd_buffer, descriptor_set, uniform_buffer)
                 })
@@ -646,8 +674,8 @@ impl GraphicsCommandPool {
         &self,
         device: &Device,
         acquire_next_image: impl FnOnce(Semaphore) -> std::result::Result<u32, Result>,
-        record_command_buffer: impl FnOnce(CommandBuffer, u32, &[DescriptorSet]) -> (),
-        update_uniform_buffer: impl FnOnce(*mut UniformBufferObject) -> (),
+        record_command_buffer: impl FnOnce(CommandBuffer, u32, &[DescriptorSet]),
+        update_uniform_buffer: impl FnOnce(*mut UniformBufferObject),
     ) -> std::result::Result<(u32, [Semaphore; 1]), Result> {
         let mut current_frame = self.current_frame.borrow_mut();
         let InFlightBuffers {
@@ -700,8 +728,8 @@ impl GraphicsCommandPool {
         unsafe {
             device
                 .queue_submit(self.queue.handle, &[*submit_info], in_flight)
-                .expect("failed to submit draw command buffer!")
-        };
+                .expect("failed to submit draw command buffer!");
+        }
 
         *current_frame = (*current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
@@ -742,21 +770,22 @@ pub struct HelloTriangleApplication {
 }
 
 impl HelloTriangleApplication {
+    #[must_use]
     pub fn new(entry: &Entry, window: &Window) -> Self {
         let occluded = {
             let winit::dpi::PhysicalSize { width, height } = window.inner_size();
 
             width == 0 || height == 0
         };
-        let instance = Self::create_instance(&entry);
+        let instance = Self::create_instance(entry);
         #[cfg(debug_assertions)]
-        let messenger = ManuallyDrop::new(unsafe { Messenger::new(&entry, &instance) });
-        let surface = WindowSurface::new(&entry, &instance, window);
-        let device_info = Self::create_logical_device(&entry, &instance, &surface);
+        let messenger = ManuallyDrop::new(unsafe { Messenger::new(entry, &instance) });
+        let surface = WindowSurface::new(entry, &instance, window);
+        let device_info = Self::create_logical_device(entry, &instance, &surface);
         let device = &device_info.device;
 
         let mut transfer_command_pool = TransferCommandPool::new(
-            &device,
+            device,
             QueueWrapper::new(device, device_info.queue_indices.transfer),
         );
         let vertex_buffer = BufferWrapper::create_buffer_with_staging(
@@ -787,7 +816,7 @@ impl HelloTriangleApplication {
 
         let descriptor_set_layout = Self::create_descriptor_layout(device);
         let (pipeline, pipeline_layout) =
-            Self::create_graphics_pipeline(&device, swap_chain.render_pass, descriptor_set_layout);
+            Self::create_graphics_pipeline(device, swap_chain.render_pass, descriptor_set_layout);
 
         let graphics_command_pool = GraphicsCommandPool::new(
             &device_info,
@@ -806,21 +835,15 @@ impl HelloTriangleApplication {
             surface,
             device_info,
             occluded,
-
             swap_chain,
-            vertex_buffer,
-            index_buffer,
-
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
-
+            vertex_buffer,
+            index_buffer,
             graphics_command_pool,
             present_queue,
-
             app_state,
-
-            #[cfg(debug_assertions)]
             messenger,
         }
     }
@@ -841,14 +864,15 @@ impl HelloTriangleApplication {
         self.app_state.update_app_state();
 
         let acquire_image_index = |img_available| self.swap_chain.acquire_next_image(img_available);
-        let (image_index, signal_semaphores) = match self.graphics_command_pool.draw_frame(
+        let drawing_result = self.graphics_command_pool.draw_frame(
             &self.device_info.device,
             acquire_image_index,
             |buffer, image_index, dst_sets| {
-                self.record_command_buffer(buffer, image_index, dst_sets)
+                self.record_command_buffer(buffer, image_index, dst_sets);
             },
             |ub_map| self.update_uniform_buffer(ub_map, &self.swap_chain.data),
-        ) {
+        );
+        let (image_index, signal_semaphores) = match drawing_result {
             Ok(i) => i,
             Err(Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.swap_chain.recreate_swap_chain(
@@ -868,7 +892,7 @@ impl HelloTriangleApplication {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        match { self.swap_chain.present(&self.present_queue, &present_info) } {
+        match self.swap_chain.present(&self.present_queue, &present_info) {
             Ok(false) => (),
             Ok(true) | Err(Result::ERROR_OUT_OF_DATE_KHR) => self.swap_chain.recreate_swap_chain(
                 &self.device_info.device,
@@ -888,6 +912,7 @@ impl HelloTriangleApplication {
 
         let view = self.app_state.get_view();
 
+        #[allow(clippy::cast_precision_loss)]
         let aspect_ratio = {
             let extent = swap_chain.extent;
             extent.width as f32 / extent.height as f32
@@ -899,7 +924,7 @@ impl HelloTriangleApplication {
         let ubo = UniformBufferObject::new(nalgebra::convert(model), view, proj);
 
         unsafe {
-            (&ubo as *const UniformBufferObject).copy_to_nonoverlapping(buffer_map, 1);
+            std::ptr::addr_of!(ubo).copy_to_nonoverlapping(buffer_map, 1);
         }
     }
 
@@ -972,7 +997,7 @@ impl HelloTriangleApplication {
             .collect();
 
         let extensions = DEVICE_EXTENSIONS.map(CStr::as_ptr);
-        let device_features: PhysicalDeviceFeatures = Default::default();
+        let device_features = PhysicalDeviceFeatures::default();
 
         let create_info = DeviceCreateInfo::builder()
             .queue_create_infos(&queue_create_infos)
@@ -998,11 +1023,11 @@ impl HelloTriangleApplication {
         device: PhysicalDevice,
         surface: SurfaceKHR,
     ) -> PartialQueueFamilyIndices {
-        let surface_fn = Surface::new(&entry, &instance);
+        let surface_fn = Surface::new(entry, instance);
 
         let props = unsafe { instance.get_physical_device_queue_family_properties(device) };
 
-        let mut result: PartialQueueFamilyIndices = Default::default();
+        let mut result = PartialQueueFamilyIndices::default();
 
         for (index, queue) in props.into_iter().enumerate() {
             let index = index as u32;
@@ -1055,9 +1080,10 @@ impl HelloTriangleApplication {
         };
 
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
-        if devices.is_empty() {
-            panic!("failed to find GPUs with Vulkan support!");
-        }
+        assert!(
+            !devices.is_empty(),
+            "failed to find GPUs with Vulkan support!"
+        );
 
         devices
             .into_iter()
@@ -1206,10 +1232,10 @@ impl HelloTriangleApplication {
         (pipeline, pipeline_layout)
     }
 
-    fn create_shader_module(device: &Device, code: &[u8]) -> ShaderModule {
+    fn create_shader_module(device: &Device, code: &[u32]) -> ShaderModule {
         let create_info = ShaderModuleCreateInfo {
             code_size: code.len(),
-            p_code: code.as_ptr() as *const u32,
+            p_code: code.as_ptr(),
 
             ..Default::default()
         };
@@ -1250,6 +1276,7 @@ impl HelloTriangleApplication {
             ..Default::default()
         };
 
+        #[allow(clippy::cast_precision_loss)]
         let viewports = [Viewport {
             x: 0.0,
             y: 0.0,
@@ -1336,6 +1363,7 @@ impl HelloTriangleApplication {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn safe_drop(mut self) -> std::result::Result<(), (ManuallyDrop<Self>, Result)> {
         match self.cleanup() {
             Ok(res) => {
@@ -1355,13 +1383,12 @@ impl HelloTriangleApplication {
 
         let bindings = [*ubo_layout_binding];
         let layout_info = DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
-        let layout = unsafe {
+
+        unsafe {
             device
                 .create_descriptor_set_layout(&layout_info, None)
                 .unwrap()
-        };
-
-        layout
+        }
     }
 
     pub fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {

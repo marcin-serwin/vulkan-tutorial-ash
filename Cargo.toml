@@ -5,6 +5,16 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+wildcard_imports = "allow"
+enum_glob_use = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+needless_for_each = "allow"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

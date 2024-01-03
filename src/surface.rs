@@ -23,6 +23,7 @@ use winit::raw_window_handle::{
 };
 use winit::window::Window;
 
+#[allow(clippy::module_name_repetitions)]
 pub struct WindowSurface {
     surface_fns: Surface,
     pub handle: SurfaceKHR,
@@ -41,7 +42,7 @@ impl WindowSurface {
 
         let surface = match (window_handle, display_handle) {
             (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) => {
-                Self::create_wayland_surface(&entry, &instance, window, display)
+                Self::create_wayland_surface(entry, instance, window, display)
             }
             #[cfg(target_os = "macos")]
             (RawWindowHandle::AppKit(window), RawDisplayHandle::AppKit(_)) => {
@@ -86,7 +87,7 @@ impl WindowSurface {
         use ash::extensions::khr::WaylandSurface;
         use ash::vk::WaylandSurfaceCreateInfoKHR;
 
-        let surface = WaylandSurface::new(&entry, &instance);
+        let surface = WaylandSurface::new(entry, instance);
 
         let create_info = WaylandSurfaceCreateInfoKHR {
             display: display_handle.display.as_ptr(),
@@ -124,21 +125,21 @@ impl SwapChain {
         let data = SwapChainData::new(
             &swapchain_fns,
             surface,
-            &swap_chain_support,
+            swap_chain_support,
             window.inner_size(),
             queue_family_indices.graphics,
             queue_family_indices.present,
         );
 
         let image_views = Self::create_image_views(device, &data);
-        let render_pass = Self::create_render_pass(&device, &data);
-        let framebuffers = Self::create_framebuffers(&device, &data, &image_views, render_pass);
+        let render_pass = Self::create_render_pass(device, &data);
+        let framebuffers = Self::create_framebuffers(device, &data, &image_views, render_pass);
 
         Self {
             swapchain_fns,
             data,
-            image_views,
             render_pass,
+            image_views,
             framebuffers,
         }
     }
@@ -232,7 +233,7 @@ impl SwapChain {
     fn create_framebuffers(
         device: &Device,
         swap_chain_data: &SwapChainData,
-        image_views: &Vec<ImageView>,
+        image_views: &[ImageView],
         render_pass: RenderPass,
     ) -> Vec<Framebuffer> {
         image_views
@@ -281,8 +282,8 @@ impl SwapChain {
         unsafe {
             device
                 .device_wait_idle()
-                .expect("failed while waiting for device idle")
-        };
+                .expect("failed while waiting for device idle");
+        }
 
         unsafe { self.cleanup_swap_chain(device) };
 
@@ -317,7 +318,7 @@ impl SwapChain {
     ) -> Result<bool, vk::Result> {
         unsafe {
             self.swapchain_fns
-                .queue_present(present_queue.handle, &present_info)
+                .queue_present(present_queue.handle, present_info)
         }
     }
 }
@@ -448,7 +449,7 @@ impl SwapChainData {
         self.images = images;
     }
 
-    fn choose_swap_surface_format(available_formats: &Vec<SurfaceFormatKHR>) -> SurfaceFormatKHR {
+    fn choose_swap_surface_format(available_formats: &[SurfaceFormatKHR]) -> SurfaceFormatKHR {
         *available_formats
             .iter()
             .find(|format| {
@@ -458,7 +459,7 @@ impl SwapChainData {
             .unwrap_or(&available_formats[0])
     }
 
-    fn choose_swap_present_mode(available_modes: &Vec<PresentModeKHR>) -> PresentModeKHR {
+    fn choose_swap_present_mode(available_modes: &[PresentModeKHR]) -> PresentModeKHR {
         *available_modes
             .iter()
             .find(|&&mode| mode == PresentModeKHR::MAILBOX)
@@ -471,17 +472,16 @@ impl SwapChainData {
     ) -> Extent2D {
         if capabilities.current_extent.width != u32::MAX {
             return capabilities.current_extent;
-        } else {
-            Extent2D {
-                width: window_size.width.clamp(
-                    capabilities.min_image_extent.width,
-                    capabilities.max_image_extent.width,
-                ),
-                height: window_size.height.clamp(
-                    capabilities.min_image_extent.height,
-                    capabilities.max_image_extent.height,
-                ),
-            }
+        }
+        Extent2D {
+            width: window_size.width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: window_size.height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
         }
     }
 }

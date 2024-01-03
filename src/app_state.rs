@@ -27,58 +27,59 @@ impl AppState {
     }
 
     pub fn update_app_state(&mut self) {
+        const SPEED: f32 = 5.0;
+
         let now = Instant::now();
+        #[allow(clippy::cast_precision_loss)]
         let elapsed = now.duration_since(self.previous_draw).as_micros() as f32 / 1e6;
         self.previous_draw = now;
         self.model_rotation +=
             std::f32::consts::FRAC_PI_2 * elapsed * (if self.reversed { -1.0 } else { 1.0 });
 
-        const SPEED: f32 = 5.0;
         let moving_direction = SPEED
             * elapsed
-            * ((self.keyboard_state.w.is_pressed() as isize as f32) * Vector3::z()
-                + (-1.0) * (self.keyboard_state.s.is_pressed() as isize as f32) * Vector3::z()
-                + (self.keyboard_state.a.is_pressed() as isize as f32) * Vector3::x()
-                + (-1.0) * (self.keyboard_state.d.is_pressed() as isize as f32) * Vector3::x());
+            * ((self.keyboard_state.w.is_pressed() as u8 as f32) * Vector3::z()
+                + (-1.0) * (self.keyboard_state.s.is_pressed() as u8 as f32) * Vector3::z()
+                + (self.keyboard_state.a.is_pressed() as u8 as f32) * Vector3::x()
+                + (-1.0) * (self.keyboard_state.d.is_pressed() as u8 as f32) * Vector3::x());
 
         self.view = Translation3::from(moving_direction) * self.view;
     }
 
     pub fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {
         use winit::event::KeyEvent;
+        use winit::keyboard::KeyCode::*;
         use winit::keyboard::PhysicalKey;
-        if let &KeyEvent {
+        let &KeyEvent {
             physical_key: PhysicalKey::Code(key_code),
             state,
             repeat,
             ..
         } = event
-        {
-            if repeat {
-                return;
-            }
+        else {
+            return;
+        };
+        if repeat {
+            return;
+        }
 
-            use winit::keyboard::KeyCode::*;
-            match key_code {
-                KeyR if state == ElementState::Pressed => {
-                    self.reversed = !self.reversed;
-                }
-                KeyW => {
-                    self.keyboard_state.w = state;
-                }
-                KeyS => {
-                    self.keyboard_state.s = state;
-                }
-                KeyD => {
-                    self.keyboard_state.d = state;
-                }
-                KeyA => {
-                    self.keyboard_state.a = state;
-                }
-                _ => {
-                    return;
-                }
+        match key_code {
+            KeyR if state == ElementState::Pressed => {
+                self.reversed = !self.reversed;
             }
+            KeyW => {
+                self.keyboard_state.w = state;
+            }
+            KeyS => {
+                self.keyboard_state.s = state;
+            }
+            KeyD => {
+                self.keyboard_state.d = state;
+            }
+            KeyA => {
+                self.keyboard_state.a = state;
+            }
+            _ => {}
         }
     }
 

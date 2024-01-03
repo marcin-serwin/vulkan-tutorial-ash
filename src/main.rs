@@ -1,15 +1,17 @@
 use ash::Entry;
 use std::sync::{atomic::AtomicU8, atomic::Ordering};
 use vulkan_tutorial_ash::HelloTriangleApplication;
+use winit::event::*;
+use winit::keyboard::*;
 use winit::{event_loop::EventLoop, window::Window};
 
 fn main() {
+    static FPS: AtomicU8 = AtomicU8::new(60);
     let event_loop = EventLoop::new().unwrap();
     let window = std::sync::Arc::new(Window::new(&event_loop).unwrap());
     let entry = Entry::linked();
 
     let mut app = HelloTriangleApplication::new(&entry, &window);
-    static FPS: AtomicU8 = AtomicU8::new(60);
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
@@ -27,8 +29,6 @@ fn main() {
     window
         .set_cursor_grab(winit::window::CursorGrabMode::Locked)
         .unwrap();
-    use winit::event::*;
-    use winit::keyboard::*;
     event_loop
         .run(|event, elwt| match event {
             Event::WindowEvent {
