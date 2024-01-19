@@ -852,6 +852,7 @@ impl HelloTriangleApplication {
             graphics_command_pool,
             present_queue,
             app_state,
+            #[cfg(debug_assertions)]
             messenger,
         }
     }
