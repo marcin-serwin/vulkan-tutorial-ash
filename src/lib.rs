@@ -15,6 +15,9 @@ use winit::window::Window;
 
 use app_state::AppState;
 
+use image::io::Reader as ImageReader;
+use image::Rgba;
+
 #[macro_use]
 mod macros {
     // based on https://users.rust-lang.org/t/can-i-conveniently-compile-bytes-into-a-rust-program-with-a-specific-alignment/24049/2
@@ -402,7 +405,7 @@ impl BufferWrapper {
         transfer_cmd_pool: &TransferCommandPool,
         usage: BufferUsageFlags,
     ) -> BufferWrapper {
-        let size = std::mem::size_of_val(data) as u64;
+        let size = std::mem::size_of_val(data) as DeviceSize;
 
         let BufferWrapper {
             buffer: staging_buffer,
@@ -422,7 +425,10 @@ impl BufferWrapper {
         }
         .expect("failed to map memory");
 
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), map_ptr.cast(), data.len()) };
+        unsafe {
+            data.as_ptr()
+                .copy_to_nonoverlapping(map_ptr.cast(), data.len());
+        };
 
         unsafe { device.device.unmap_memory(staging_memory) };
 
@@ -788,6 +794,8 @@ impl HelloTriangleApplication {
             device,
             QueueWrapper::new(device, device_info.queue_indices.transfer),
         );
+        Self::create_texture_image();
+
         let vertex_buffer = BufferWrapper::create_buffer_with_staging(
             &device_info,
             VERTICES,
@@ -846,6 +854,24 @@ impl HelloTriangleApplication {
             app_state,
             messenger,
         }
+    }
+
+    fn create_texture_image() {
+        let img = ImageReader::with_format(
+            std::io::Cursor::new(include_bytes!("textures/texture.jpg")),
+            image::ImageFormat::Jpeg,
+        )
+        .decode()
+        .unwrap()
+        .into_rgba8();
+        let image_size = img.as_raw().len() as DeviceSize;
+
+        debug_assert_eq!(
+            image_size,
+            img.width() as DeviceSize
+                * img.height() as DeviceSize
+                * std::mem::size_of::<Rgba<u8>>() as DeviceSize
+        );
     }
 
     pub fn window_resized(&mut self, size: PhysicalSize<u32>) {

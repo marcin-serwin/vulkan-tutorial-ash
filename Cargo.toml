@@ -19,6 +19,7 @@ needless_for_each = "allow"
 
 [dependencies]
 ash = { version = "0.37.3", features = ["linked"] }
+image = { version = "0.24.8", features = ["jpeg"], default-features = false }
 nalgebra = "0.32.3"
 winit = "0.29.6"
 
