@@ -1107,10 +1107,6 @@ impl HelloTriangleApplication {
         };
 
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
-        assert!(
-            !devices.is_empty(),
-            "failed to find GPUs with Vulkan support!"
-        );
 
         devices
             .into_iter()
