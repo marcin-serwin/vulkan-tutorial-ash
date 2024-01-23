@@ -1,8 +1,9 @@
 mod app_state;
 mod surface;
+mod utils;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_void, CStr};
 use std::mem::ManuallyDrop;
 use surface::{SwapChain, SwapChainData, WindowSurface};
 
@@ -18,60 +19,12 @@ use app_state::AppState;
 use image::io::Reader as ImageReader;
 use image::Rgba;
 
-#[macro_use]
-mod macros {
-    // based on https://users.rust-lang.org/t/can-i-conveniently-compile-bytes-into-a-rust-program-with-a-specific-alignment/24049/2
-    #[repr(C)] // guarantee 'bytes' comes after '_align'
-    pub struct AlignedAs<Align, Bytes: ?Sized> {
-        pub _align: [Align; 0],
-        pub bytes: Bytes,
-    }
-
-    macro_rules! include_bytes_as_array {
-        ($align_ty:ty, $path:expr) => {{
-            // const block expression to encapsulate the static
-            use $crate::macros::AlignedAs;
-            // this assignment is made possible by CoerceUnsized
-            static ALIGNED: &AlignedAs<$align_ty, [u8]> = &AlignedAs {
-                _align: [],
-                bytes: *include_bytes!($path),
-            };
-
-            assert!(ALIGNED.bytes.len() % ::std::mem::size_of::<$align_ty>() == 0);
-
-            unsafe { &*(&ALIGNED.bytes as *const [u8] as *const [$align_ty]) }
-        }};
-    }
-}
+use utils::{cstr, include_bytes_as_array, name_to_cstr, offset_of};
 
 macro_rules! include_shader {
     ($name:literal) => {
         include_bytes_as_array!(u32, concat!(env!("OUT_DIR"), "/", $name))
     };
-}
-
-macro_rules! cstr {
-    ($str:literal) => {{
-        const RESULT: &CStr =
-            unsafe { CStr::from_bytes_with_nul_unchecked(concat!($str, "\0").as_bytes()) };
-        RESULT
-    }};
-}
-
-macro_rules! offset_of {
-    ($ty:ident, $field:ident) => {{
-        const OFFSET: usize = {
-            let s = std::mem::MaybeUninit::<$ty>::uninit();
-            let s_ptr = s.as_ptr();
-            let f_ptr = unsafe { std::ptr::addr_of!((*s_ptr).$field) };
-            (unsafe { f_ptr.byte_offset_from(s_ptr) }) as usize
-        };
-        OFFSET
-    }};
-}
-
-fn name_to_cstr(name: &[c_char]) -> &CStr {
-    CStr::from_bytes_until_nul(unsafe { &*(name as *const [c_char] as *const [u8]) }).unwrap()
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -1256,12 +1209,7 @@ impl HelloTriangleApplication {
     }
 
     fn create_shader_module(device: &Device, code: &[u32]) -> ShaderModule {
-        let create_info = ShaderModuleCreateInfo {
-            code_size: code.len(),
-            p_code: code.as_ptr(),
-
-            ..Default::default()
-        };
+        let create_info = ShaderModuleCreateInfo::builder().code(code);
 
         unsafe { device.create_shader_module(&create_info, None) }
             .expect("failed to create shader module")
