@@ -213,6 +213,7 @@ struct SwapChainSupportDetails {
 
 struct DeviceInfo {
     device: Device,
+    physical_device: PhysicalDevice,
     swap_chain_support: SwapChainSupportDetails,
     queue_indices: QueueFamilyIndices,
     physical_memory_properties: PhysicalDeviceMemoryProperties,
@@ -220,12 +221,10 @@ struct DeviceInfo {
 
 impl DeviceInfo {
     fn query_swap_chain_support(
-        entry: &Entry,
-        instance: &Instance,
+        surface_fn: &Surface,
         device: PhysicalDevice,
         surface: SurfaceKHR,
     ) -> SwapChainSupportDetails {
-        let surface_fn = Surface::new(entry, instance);
         let capabilities =
             unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface) }
                 .unwrap_or_default();
@@ -706,6 +705,7 @@ impl GraphicsCommandPool {
 
 pub struct HelloTriangleApplication {
     instance: Instance,
+    surface_fn: Surface,
     surface: WindowSurface,
     device_info: DeviceInfo,
     pub occluded: bool,
@@ -737,10 +737,11 @@ impl HelloTriangleApplication {
             width == 0 || height == 0
         };
         let instance = Self::create_instance(entry);
+        let surface_fn = Surface::new(entry, &instance);
         #[cfg(debug_assertions)]
         let messenger = ManuallyDrop::new(unsafe { Messenger::new(entry, &instance) });
         let surface = WindowSurface::new(entry, &instance, window);
-        let device_info = Self::create_logical_device(entry, &instance, &surface);
+        let device_info = Self::create_logical_device(&surface_fn, &instance, &surface);
         let device = &device_info.device;
 
         let mut transfer_command_pool = TransferCommandPool::new(
@@ -793,6 +794,7 @@ impl HelloTriangleApplication {
 
         Self {
             instance,
+            surface_fn,
             surface,
             device_info,
             occluded,
@@ -829,6 +831,11 @@ impl HelloTriangleApplication {
     }
 
     pub fn window_resized(&mut self, size: PhysicalSize<u32>) {
+        self.device_info.swap_chain_support = DeviceInfo::query_swap_chain_support(
+            &self.surface_fn,
+            self.device_info.physical_device,
+            self.surface.handle,
+        );
         self.swap_chain.recreate_swap_chain(
             &self.device_info.device,
             self.surface.handle,
@@ -950,12 +957,12 @@ impl HelloTriangleApplication {
     }
 
     fn create_logical_device(
-        entry: &Entry,
+        surface_fn: &Surface,
         instance: &Instance,
         surface: &WindowSurface,
     ) -> DeviceInfo {
         let (physical_device, queue_indices, swap_chain_support_details) =
-            Self::pick_physical_device(entry, instance, surface.handle);
+            Self::pick_physical_device(surface_fn, instance, surface.handle);
 
         let unique_indices = {
             let mut set = HashSet::new();
@@ -991,6 +998,7 @@ impl HelloTriangleApplication {
 
         DeviceInfo {
             device,
+            physical_device,
             queue_indices,
             swap_chain_support: swap_chain_support_details,
             physical_memory_properties: mem_props,
@@ -998,13 +1006,11 @@ impl HelloTriangleApplication {
     }
 
     fn find_queue_families(
-        entry: &Entry,
+        surface_fn: &Surface,
         instance: &Instance,
         device: PhysicalDevice,
         surface: SurfaceKHR,
     ) -> PartialQueueFamilyIndices {
-        let surface_fn = Surface::new(entry, instance);
-
         let props = unsafe { instance.get_physical_device_queue_family_properties(device) };
 
         let mut result = PartialQueueFamilyIndices::default();
@@ -1036,7 +1042,7 @@ impl HelloTriangleApplication {
     }
 
     fn pick_physical_device(
-        entry: &Entry,
+        surface_fn: &Surface,
         instance: &Instance,
         surface: SurfaceKHR,
     ) -> (PhysicalDevice, QueueFamilyIndices, SwapChainSupportDetails) {
@@ -1046,7 +1052,7 @@ impl HelloTriangleApplication {
             }
 
             let swap_chain_support =
-                DeviceInfo::query_swap_chain_support(entry, instance, device, surface);
+                DeviceInfo::query_swap_chain_support(surface_fn, device, surface);
             if swap_chain_support.formats.is_empty() || swap_chain_support.present_modes.is_empty()
             {
                 return None;
@@ -1054,7 +1060,7 @@ impl HelloTriangleApplication {
 
             Some((
                 device,
-                Self::find_queue_families(entry, instance, device, surface).as_total()?,
+                Self::find_queue_families(surface_fn, instance, device, surface).as_total()?,
                 swap_chain_support,
             ))
         };
